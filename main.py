@@ -117,8 +117,16 @@ async def startup_event():
             if not (model_path / file).exists():
                 logger.error(f"Missing required file: {model_path / file}")
                 raise RuntimeError(f"Invalid spaCy model at {model_path}. Missing {file}")
-        nlp = spacy.load(model_path)
-        logger.info(f"Loaded spaCy model from {model_path}")
+        try:
+            import spacy_transformers
+            nlp = spacy.load(model_path)
+            logger.info(f"Loaded spaCy model with transformer support from {model_path}")
+        except ImportError:
+            logger.warning("spacy-transformers not installed, falling back to non-transformer classification")
+            nlp = None
+        except Exception as e:
+            logger.error(f"Failed to load spaCy model: {str(e)}")
+            nlp = None
         await openai_client.chat.completions.create(
             model="gemma-3-12b-it",
             messages=[{"role": "user", "content": "Test"}],
@@ -497,3 +505,8 @@ async def health_check():
     except Exception as e:
         logger.error(f"Health check failed: {str(e)}")
         return {"status": "unhealthy", "error": str(e)}
+
+if __name__ == "__main__":
+    import uvicorn
+    port = int(environ.get("PORT", 10000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
