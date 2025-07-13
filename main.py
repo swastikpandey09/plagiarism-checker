@@ -7,8 +7,8 @@ from pathlib import Path
 from typing import List, Tuple, Dict, Any, Optional
 import asyncio
 import numpy as np
-from fastapi import FastAPI, Form, Request
-from fastapi.responses import HTMLResponse
+from fastapi import FastAPI, Form, Request, HTTPException
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, validator
@@ -17,6 +17,13 @@ import py7zr
 import tempfile
 import shutil
 from os import environ
+import importlib.util
+
+# Check dependencies
+required_modules = ["fastapi", "uvicorn", "jinja2", "openai", "numpy", "py7zr"]
+for module in required_modules:
+    if not importlib.util.find_spec(module):
+        raise ImportError(f"Required module {module} is not installed")
 
 # Initialize FastAPI app
 app = FastAPI(title="Code Plagiarism Detector")
@@ -25,7 +32,9 @@ app = FastAPI(title="Code Plagiarism Detector")
 BASE_DIR = Path(__file__).resolve().parent
 TEMPLATES_DIR = BASE_DIR / "templates"
 STATIC_DIR = BASE_DIR / "static"
-MODEL_ARCHIVE = BASE_DIR / "dataset" / "output" / "model-best" / "transformer" / "model.7z"
+MODEL_DIR = BASE_DIR / "dataset" / "output" / "model-best" / "transformer"
+MODEL_DIR.mkdir(parents=True, exist_ok=True)
+MODEL_ARCHIVE = MODEL_DIR / "model.7z"
 TEMP_MODEL_DIR = Path(tempfile.mkdtemp())
 INPUT_1568 = BASE_DIR / "input1568.txt"
 INPUT_1435 = BASE_DIR / "input1435.txt"
@@ -43,19 +52,26 @@ CONFIG = {
 
 # Logging setup
 valid_log_levels = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
-log_level = environ.get("LOG_LEVEL", "DEBUG").upper()
+log_level = environ.get("LOG_LEVEL", "INFO").upper()
 if log_level not in valid_log_levels:
-    log_level = "DEBUG"
-logging.basicConfig(level=getattr(logging, log_level), format="%(levelname)s | %(asctime)s | %(message)s")
+    log_level = "INFO"
 logger = logging.getLogger(__name__)
+logger.setLevel(getattr(logging, log_level))
+handler = logging.StreamHandler()
+handler.setFormatter(logging.Formatter("%(levelname)s | %(asctime)s | %(message)s"))
+logger.addHandler(handler)
 
-# Initialize dependencies
-openai_client = AsyncOpenAI(
-    base_url=environ.get("LM_STUDIO_URL", "https://670sn0rg-1234.inc1.devtunnels.ms/v1"),
-    api_key="not-needed"
-)
+# Initialize OpenAI client
+LM_STUDIO_URL = environ.get("LM_STUDIO_URL", "http://localhost:1234/v1")
+openai_client = AsyncOpenAI(base_url=LM_STUDIO_URL, api_key="not-needed")
 
-# Verify MODEL_ARCHIVE exists (for reference, not loaded)
+# Verify directories and files
+if not TEMPLATES_DIR.exists() or not (TEMPLATES_DIR / "index.html").exists():
+    logger.error("Template directory or index.html not found")
+    raise RuntimeError("Template directory or index.html not found")
+if not STATIC_DIR.exists():
+    logger.error("Static directory not found")
+    raise RuntimeError("Static directory not found")
 if not MODEL_ARCHIVE.exists():
     logger.warning("Model archive %s not found, skipping spaCy model loading", MODEL_ARCHIVE)
 else:
@@ -69,6 +85,21 @@ templates = Jinja2Templates(directory=TEMPLATES_DIR)
 class SingleCodeInput(BaseModel):
     code: str
     handle: str = "triumph"
+
+    @validator("code")
+    def validate_code(cls, v):
+        if not v.strip():
+            raise ValueError("Code cannot be empty")
+        if len(v) > 100_000:
+            raise ValueError("Code exceeds maximum length of 100,000 characters")
+        if any(c in v for c in ['\0', '\x1b']):
+            raise ValueError("Code contains invalid control characters")
+        try:
+            v.encode('utf-8').decode('utf-8')
+        except UnicodeDecodeError:
+            raise ValueError("Invalid UTF-8 encoding in code")
+        return v
+
     @validator("handle")
     def validate_handle(cls, v):
         if not v.strip() or any(c in v for c in "\n$"):
@@ -80,12 +111,12 @@ class SingleCodeInput(BaseModel):
 @app.on_event("startup")
 async def startup_event():
     try:
-        await openai_client.chat.completions.create(
-            model="gemma-3-12b-it",
-            messages=[{"role": "user", "content": "Test"}],
-            max_tokens=10
-        )
-        logger.info("OpenAI client initialized successfully")
+        response = await openai_client.models.list()
+        if response.data:
+            logger.info("OpenAI client initialized successfully")
+        else:
+            logger.error("No models available from API")
+            raise RuntimeError("No models available from API")
     except Exception as e:
         logger.error(f"Startup failed: {str(e)}")
         raise RuntimeError(f"Startup failed: {str(e)}")
@@ -98,17 +129,27 @@ async def cleanup():
             logger.info(f"Cleaned up temporary directory {TEMP_MODEL_DIR}")
         for file in [INPUT_1568, INPUT_1435, OUTPUT_1435]:
             if file.exists():
-                file.unlink()
-                logger.info(f"Removed {file}")
+                try:
+                    file.unlink()
+                    logger.info(f"Removed {file}")
+                except PermissionError as e:
+                    logger.error(f"Permission denied when removing {file}: {str(e)}")
     except Exception as e:
         logger.error(f"Failed to clean up: {str(e)}")
 
 # Code processing utilities
-def clean_code(code: str) -> str:
-    if not code:
+def clean_code(code: str, preserve_comments: bool = False) -> str:
+    if not isinstance(code, str):
+        logger.error("Input code must be a string")
         return ""
-    code = re.sub(r'//.*', '', code)
-    code = re.sub(r'/\*.*?\*/', '', code, flags=re.DOTALL)
+    try:
+        code = code.encode('utf-8').decode('utf-8')
+    except UnicodeDecodeError:
+        logger.error("Invalid UTF-8 encoding in code")
+        return ""
+    if not preserve_comments:
+        code = re.sub(r'//.*', '', code)
+        code = re.sub(r'/\*.*?\*/', '', code, flags=re.DOTALL)
     return re.sub(r'\s+', ' ', code).strip()
 
 def tokenize_code(line: str) -> List[str]:
@@ -116,12 +157,13 @@ def tokenize_code(line: str) -> List[str]:
         return []
     line = re.sub(r'//.*$', '', line)
     line = re.sub(r'/\*.*?\*/', '', line, flags=re.DOTALL)
-    return re.findall(r'[a-zA-Z_][a-zA-Z0-9_]*|[{}();,=<>+\-*&]|[0-9]+', line)
+    return re.findall(r'[a-zA-Z_][a-zA-Z0-9_]*|[{}();,=<>+\-*&|]|\d+|::|->|\.\w+', line)
 
 def extract_variables(code: str) -> Tuple[List[str], bool]:
-    primitives = {"int", "long", "short", "float", "double", "ch", "bool", "void", "auto", "unsigned", "signed", "size_t"}
+    primitives = {"int", "long", "short", "float", "double", "char", "bool", "void", "auto", "unsigned", "signed", "size_t"}
     containers = {"vector", "stack", "queue", "deque", "map", "set", "pair", "string"}
-    keywords = {"main", "first", "second", "top", "push", "pop", "begin", "end", "size", "clear", "empty", "insert", "erase", "find", "sort", "reverse"}
+    keywords = {"main", "first", "second", "top", "push", "pop", "begin", "end", "size", "clear", "empty", "insert", "erase", "find", "sort", "reverse",
+                "if", "else", "for", "while", "return", "const", "static", "class", "struct"}
     variables = set()
     for line in code.splitlines():
         tokens = tokenize_code(line)
@@ -131,7 +173,7 @@ def extract_variables(code: str) -> Tuple[List[str], bool]:
             if type_str and j < len(tokens):
                 i = j
                 while i < len(tokens) and tokens[i] != ";":
-                    if (tokens[i] not in ("*", "&", ",", "=", "(", ")") and
+                    if (tokens[i] not in ("*", "&", ",", "=", "(", ")", "[", "]", "{", "}") and
                         tokens[i] not in keywords and
                         tokens[i] not in primitives and
                         tokens[i] not in containers and
@@ -193,13 +235,15 @@ def pad_string(text: str) -> str:
 
 def string_to_matrix(text: str, max_lines: int = 1000) -> List[List[int]]:
     if not text:
-        return []
+        return [[0]]
     lines = text.splitlines()[:max_lines]
+    if not lines:
+        return [[0]]
     return [[ord(char) % 128 for char in line] for line in lines if line]
 
 def extract_submatrix(matrix: List[List[int]], center: List[int], size: int = 3) -> List[List[int]]:
     if not matrix or not matrix[0]:
-        return []
+        return [[0]]
     half_size = size // 2
     rows, cols = len(matrix), len(matrix[0])
     row_start = max(0, center[0] - half_size)
@@ -234,13 +278,14 @@ def compute_hash(text: str, by_line: bool = True) -> List[int]:
     if not text:
         return []
     segments = text.splitlines() if by_line else [text]
-    hashes = [int(hashlib.sha256(segment.encode()).hexdigest(), 16) % (2**64) 
+    hashes = [int(hashlib.sha256(segment.encode()).hexdigest(), 16) % (2**64)
               for segment in segments if segment.strip()]
     return sorted(hashes)
 
-def lcs_length(str1: str, str2: str) -> int:
+def lcs_length(str1: str, str2: str, max_length: int = 10000) -> int:
     if not str1 or not str2:
         return 0
+    str1, str2 = str1[:max_length], str2[:max_length]
     if len(str1) < len(str2):
         str1, str2 = str2, str1
     n, m = len(str1), len(str2)
@@ -260,8 +305,15 @@ def compare_codes(code1: str, code2: str) -> Tuple[bool, str]:
     lcs_ratio = lcs_score / min(len(code1_clean), len(code2_clean)) if code1_clean and code2_clean else 0
     return lcs_ratio >= CONFIG["lcs_threshold"], f"LCS: {lcs_ratio:.2f}"
 
-async def query_api(messages: str, model: str = "gemma-3-12b-it", temp: float = 0.7, max_tokens: int = -1) -> str:
+async def query_api(messages: str, model: str = None, temp: float = 0.7, max_tokens: int = -1) -> str:
     try:
+        if not model:
+            health = await health_check()
+            if health["status"] == "healthy" and health["models"]:
+                model = health["models"][0]
+            else:
+                logger.error("No models available for API request")
+                return ""
         messages_list = json.loads(messages)
         messages_dicts = [dict(msg) for msg in messages_list]
         logger.debug(f"Sending API request with messages: {messages_dicts}")
@@ -275,7 +327,13 @@ async def query_api(messages: str, model: str = "gemma-3-12b-it", temp: float = 
         content = response.choices[0].message.content
         logger.debug(f"API response: {content[:100]}...")
         match = re.search(r"```cpp\n(.*?)```", content, re.DOTALL)
-        return match.group(1).strip() if match else ""
+        if not match:
+            logger.error("No valid C++ code found in API response")
+            return ""
+        return match.group(1).strip()
+    except json.JSONDecodeError as e:
+        logger.error(f"Invalid JSON messages: {str(e)}")
+        return ""
     except Exception as e:
         logger.error(f"API query failed: {str(e)}")
         return ""
@@ -297,6 +355,7 @@ async def detect_plagiarism_with_generated(code: str, generated: str) -> Tuple[b
     is_similar, lcs_details = compare_codes(code, generated)
     evidence = [f"Delta: {delta:.4f}", lcs_details]
     is_plagiarized = delta < CONFIG["plagiarism_threshold"] or is_similar
+    logger.debug(f"Plagiarism check: delta={delta:.4f}, is_similar={is_similar}, thresholds={CONFIG['plagiarism_threshold']}/{CONFIG['lcs_threshold']}")
     return is_plagiarized, delta, f"Delta: {delta:.4f}", "S" if is_similar else "N", evidence
 
 async def classify_code(code: str, handle: str) -> Tuple[bool, str, float, str]:
@@ -320,9 +379,12 @@ async def classify_code(code: str, handle: str) -> Tuple[bool, str, float, str]:
 
 def process_code_submission(code: str, handle: str):
     try:
+        INPUT_1568.parent.mkdir(parents=True, exist_ok=True)
+        INPUT_1435.parent.mkdir(parents=True, exist_ok=True)
+        
         if INPUT_1568.exists():
             INPUT_1568.unlink()
-        with open(INPUT_1568, "w") as f:
+        with open(INPUT_1568, "w", encoding="utf-8") as f:
             f.write(code.strip() + "\n")
             f.write("R77q\n")
             f.write(f"{handle}$")
@@ -333,18 +395,42 @@ def process_code_submission(code: str, handle: str):
             return
         
         formatted_code = f"xc9@{handle}\n{cleaned_code}\n"
-        with open(INPUT_1435, "w") as f:
+        with open(INPUT_1435, "w", encoding="utf-8") as f:
             f.write(formatted_code)
         logger.info(f"Processed code for handle {handle} and written to {INPUT_1435}")
+    except PermissionError as e:
+        logger.error(f"Permission error writing files for handle {handle}: {str(e)}")
+        raise
     except Exception as e:
         logger.error(f"Failed to process code for handle {handle}: {str(e)}")
         raise
 
 def detect_similar_codes(code: str, handle: str) -> List[str]:
     try:
-        with open(OUTPUT_1435, "w") as f:
-            f.write("0 similar pairs of codes detected\n\n0 cheaters detected:\n")
-        return []
+        cleaned_code = clean_code(code)
+        code_hash = compute_hash(cleaned_code)
+        similar_handles = []
+        if INPUT_1435.exists():
+            with open(INPUT_1435, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+                i = 0
+                while i < len(lines):
+                    if lines[i].startswith("xc9@"):
+                        other_handle = lines[i].split("@")[1].split("\n")[0]
+                        if other_handle != handle:
+                            other_code = "".join(lines[i+1:lines.index("\n", i+1) if "\n" in lines[i+1:] else len(lines)])
+                            other_hash = compute_hash(clean_code(other_code))
+                            if any(h1 == h2 for h1, h2 in zip(code_hash, other_hash)):
+                                similar_handles.append(other_handle)
+                        i += lines[i+1:].index("\n") + 1 if "\n" in lines[i+1:] else len(lines)
+                    else:
+                        i += 1
+        OUTPUT_1435.parent.mkdir(parents=True, exist_ok=True)
+        with open(OUTPUT_1435, "w", encoding="utf-8") as f:
+            f.write(f"{len(similar_handles)} similar pairs of codes detected\n\n")
+            f.write(f"{len(similar_handles)} cheaters detected:\n")
+            f.write("\n".join(similar_handles) + "\n")
+        return similar_handles
     except Exception as e:
         logger.error(f"Failed to detect similar codes: {str(e)}")
         return []
@@ -354,10 +440,10 @@ def prepend_code_count():
         if not INPUT_1435.exists():
             logger.error("input1435.txt not found")
             return
-        with open(INPUT_1435, "r") as f:
+        with open(INPUT_1435, "r", encoding="utf-8") as f:
             lines = f.readlines()
         code_count = 1
-        with open(INPUT_1435, "w") as f:
+        with open(INPUT_1435, "w", encoding="utf-8") as f:
             f.write(f"{code_count}\n")
             f.writelines(lines)
         logger.info(f"Prepended code count {code_count} to input1435.txt")
@@ -365,8 +451,8 @@ def prepend_code_count():
         logger.error(f"Failed to prepend code count: {str(e)}")
         raise
 
-def generate_report(analysis: Dict[str, Any], issues: List[str], handle: str, 
-                   model1_result: Optional[Tuple[str, List[str]]] = None, 
+def generate_report(analysis: Dict[str, Any], issues: List[str], handle: str,
+                   model1_result: Optional[Tuple[str, List[str]]] = None,
                    model2_result: Optional[Tuple[str, List[str]]] = None) -> str:
     report = f"Report for {handle}\n\n"
     report += f"AI/Human Classification:\nLabel: {analysis['label']} (Confidence: {analysis['confidence']:.2%})\n"
@@ -401,58 +487,106 @@ async def get_index(request: Request):
 @app.post("/a", response_class=HTMLResponse)
 async def analyze_code_form(request: Request, code: str = Form(..., max_length=100_000), handle: str = Form("triumph")):
     try:
-        if not code.strip():
-            return templates.TemplateResponse("index.html", {"request": request, "error": "Code cannot be empty"})
+        input_data = SingleCodeInput(code=code, handle=handle)
         
-        # Validate handle
-        SingleCodeInput(code=code, handle=handle)
-        
-        # Check API health
         health = await health_check()
         if health["status"] != "healthy":
             logger.error(f"LM Studio API unavailable: {health.get('error', 'Unknown error')}")
-            return templates.TemplateResponse("index.html", {"request": request, "error": "LM Studio API is unavailable"})
+            raise HTTPException(status_code=503, detail="LM Studio API is unavailable")
         
-        # Run Python-based analysis
-        logger.debug(f"Processing code (first 100 chars): {code[:100]}...")
-        success, label, confidence, handle = await classify_code(code, handle)
-        if not success:
-            return templates.TemplateResponse("index.html", {"request": request, "error": label})
-        variables, has_long_vars = extract_variables(code)
-        issues = [f"Variables longer than {CONFIG['var_length']} characters" if has_long_vars else "",
-                  "Suspicious comments" if has_suspicious_comments(code) else ""]
-        issues = [x for x in issues if x]
-        
-        # Call query_api once
-        messages = [
-            {"role": "system", "content": "Generate C++ code that matches the functionality of the given code."},
-            {"role": "user", "content": code}
-        ]
-        hashable_messages = json.dumps([tuple(sorted(d.items())) for d in messages])
-        generated = await query_api(hashable_messages)
-        if not generated:
-            return templates.TemplateResponse("index.html", {"request": request, "error": "Failed to generate code from API"})
-        
-        # Use generated code for both analyses
-        is_similar, delta, delta_details = await analyze_code_with_generated(code, generated)
-        model1_result = ("S" if is_similar else "N", [delta_details])
-        is_plagiarized, delta, delta_details, sim_status, evidence = await detect_plagiarism_with_generated(code, generated)
-        model2_result = ("S" if is_plagiarized else "N", [delta_details] + evidence)
-        
-        # Process code
-        process_code_submission(code, handle)
-        prepend_code_count()
-        c_similar_handles = detect_similar_codes(code, handle)
-        
-        analysis = {"label": label, "confidence": confidence}
-        report = generate_report(analysis, issues, handle, model1_result, model2_result)
-        return templates.TemplateResponse("index.html", {
-            "request": request,
-            "result": {"handle": handle, "report": report, "confidence": confidence, "label": label}
-        })
+        async with asyncio.timeout(60):
+            logger.debug(f"Processing code (first 100 chars): {code[:100]}...")
+            success, label, confidence, handle = await classify_code(code, handle)
+            if not success:
+                return templates.TemplateResponse("index.html", {"request": request, "error": label})
+            variables, has_long_vars = extract_variables(code)
+            issues = [f"Variables longer than {CONFIG['var_length']} characters" if has_long_vars else "",
+                      "Suspicious comments" if has_suspicious_comments(code) else ""]
+            issues = [x for x in issues if x]
+            
+            messages = [
+                {"role": "system", "content": "Generate C++ code that matches the functionality of the given code."},
+                {"role": "user", "content": code}
+            ]
+            hashable_messages = json.dumps([tuple(sorted(d.items())) for d in messages])
+            generated = await query_api(hashable_messages)
+            if not generated:
+                raise HTTPException(status_code=500, detail="Failed to generate code from API")
+            
+            is_similar, delta, delta_details = await analyze_code_with_generated(code, generated)
+            model1_result = ("S" if is_similar else "N", [delta_details])
+            is_plagiarized, delta, delta_details, sim_status, evidence = await detect_plagiarism_with_generated(code, generated)
+            model2_result = ("S" if is_plagiarized else "N", [delta_details] + evidence)
+            
+            process_code_submission(code, handle)
+            prepend_code_count()
+            c_similar_handles = detect_similar_codes(code, handle)
+            
+            analysis = {"label": label, "confidence": confidence}
+            report = generate_report(analysis, issues, handle, model1_result, model2_result)
+            return templates.TemplateResponse("index.html", {
+                "request": request,
+                "result": {"handle": handle, "report": report, "confidence": confidence, "label": label}
+            })
+    except asyncio.TimeoutError:
+        logger.error(f"Analysis timed out for handle {handle}")
+        raise HTTPException(status_code=504, detail="Analysis timed out")
     except Exception as e:
         logger.error(f"Analyze form endpoint failed: {str(e)}")
-        return templates.TemplateResponse("index.html", {"request": request, "error": str(e)})
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/analyze", response_model=dict)
+async def analyze_code_api(code: str = Form(..., max_length=100_000), handle: str = Form("triumph")):
+    try:
+        input_data = SingleCodeInput(code=code, handle=handle)
+        
+        health = await health_check()
+        if health["status"] != "healthy":
+            return JSONResponse(status_code=503, content={"error": "LM Studio API is unavailable"})
+        
+        async with asyncio.timeout(60):
+            success, label, confidence, handle = await classify_code(code, handle)
+            if not success:
+                return JSONResponse(status_code=400, content={"error": label})
+            variables, has_long_vars = extract_variables(code)
+            issues = [f"Variables longer than {CONFIG['var_length']} characters" if has_long_vars else "",
+                      "Suspicious comments" if has_suspicious_comments(code) else ""]
+            issues = [x for x in issues if x]
+            
+            messages = [
+                {"role": "system", "content": "Generate C++ code that matches the functionality of the given code."},
+                {"role": "user", "content": code}
+            ]
+            hashable_messages = json.dumps([tuple(sorted(d.items())) for d in messages])
+            generated = await query_api(hashable_messages)
+            if not generated:
+                return JSONResponse(status_code=500, content={"error": "Failed to generate code from API"})
+            
+            is_similar, delta, delta_details = await analyze_code_with_generated(code, generated)
+            model1_result = ("S" if is_similar else "N", [delta_details])
+            is_plagiarized, delta, delta_details, sim_status, evidence = await detect_plagiarism_with_generated(code, generated)
+            model2_result = ("S" if is_plagiarized else "N", [delta_details] + evidence)
+            
+            process_code_submission(code, handle)
+            prepend_code_count()
+            c_similar_handles = detect_similar_codes(code, handle)
+            
+            analysis = {"label": label, "confidence": confidence}
+            report = generate_report(analysis, issues, handle, model1_result, model2_result)
+            return {
+                "handle": handle,
+                "report": report,
+                "confidence": confidence,
+                "label": label,
+                "issues": issues,
+                "similar_handles": c_similar_handles
+            }
+    except asyncio.TimeoutError:
+        logger.error(f"Analysis timed out for handle {handle}")
+        return JSONResponse(status_code=504, content={"error": "Analysis timed out"})
+    except Exception as e:
+        logger.error(f"Analyze API endpoint failed: {str(e)}")
+        return JSONResponse(status_code=500, content={"error": str(e)})
 
 @app.get("/health")
 async def health_check():
@@ -465,5 +599,11 @@ async def health_check():
 
 if __name__ == "__main__":
     import uvicorn
-    port = int(environ.get("PORT", 10000))
+    try:
+        port = int(environ.get("PORT", 10000))
+        if not (1 <= port <= 65535):
+            raise ValueError("Port must be between 1 and 65535")
+    except ValueError as e:
+        logger.error(f"Invalid port number: {str(e)}")
+        port = 10000
     uvicorn.run(app, host="0.0.0.0", port=port, reload=False)
