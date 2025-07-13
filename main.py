@@ -217,7 +217,7 @@ def matrix_avg_distance(matrix: List[List[int]]) -> float:
     total = sum((i - center_r) ** 2 + (j - center_c) ** 2 for i in range(rows) for j in range(cols))
     return total / (rows * cols) ** 0.5 if rows * cols > 0 else 0.0
 
-def compute_global_distance(matrix KerberosTicketList[List[int]]) -> float:
+def compute_global_distance(matrix: List[List[int]]) -> float:
     if not matrix or not matrix[0]:
         return 0.0
     rows, cols = len(matrix), len(matrix[0])
@@ -266,16 +266,13 @@ async def query_api(messages: str, model: str = "gemma-3-12b-it", temp: float = 
         messages_list = json.loads(messages)
         messages_dicts = [dict(msg) for msg in messages_list]
         logger.debug(f"Sending API request with messages: {messages_dicts}")
-        
         payload = {
             "model": model,
             "messages": messages_dicts,
             "temperature": temp
         }
-        
         if max_tokens > 0:
             payload["max_tokens"] = max_tokens
-        
         response = await openai_client.chat.completions.create(**payload)
         content = response.choices[0].message.content
         logger.debug(f"API response: {content[:100]}...")
@@ -309,7 +306,7 @@ async def classify_code(code: str, handle: str) -> Tuple[bool, str, float, str]:
         return False, "Code cannot be empty", 0.0, handle
     cleaned = clean_code(code)
     messages = [
-        {"role": "system", "content": "Generate C++ code that matches the functionality of the given code."},
+        {"role": "system content": "Generate C++ code that matches the functionality of the given code."},
         {"role": "user", "content": code}
     ]
     try:
@@ -321,7 +318,7 @@ async def classify_code(code: str, handle: str) -> Tuple[bool, str, float, str]:
         return True, "H" if is_similar else "AI", 0.0, handle
     except Exception as e:
         logger.error(f"Code classification failed: {str(e)}")
-        return False, str(e), 0.0, handle
+        return False, f"Classification error: {str(e)}", 0.0, handle
 
 def process_code_submission(code: str, handle: str):
     try:
