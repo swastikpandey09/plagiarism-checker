@@ -1,193 +1,33 @@
 <!DOCTYPE html>
-<html lang="en">
+<html>
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Code AI/Human Classifier & Plagiarism Detector</title>
-    <style>
-        body {
-            font-family: 'Verdana', sans-serif;
-            background-color: #f7f7f7; /* Light gray, contrast with #333 text: 12.3:1 */
-            color: #333; /* Dark gray text */
-            margin: 20px auto;
-            max-width: 900px;
-            line-height: 1.5;
-        }
-        .a {
-            display: flex;
-            justify-content: center;
-            align-items: center;
-            width: 40px;
-            height: 40px;
-            background-color: #d3d3d3; /* Light gray button */
-            border-radius: 50%;
-            border: none;
-            color: #006400; /* Dark green, contrast with #d3d3d3: 5.9:1 */
-            font-size: 24px; /* Large text, 3:1+ required */
-            font-weight: bold;
-            cursor: pointer;
-            outline: none;
-            transition: background-color 0.3s;
-        }
-        .a:hover {
-            background-color: #b0b0b0; /* Darker gray, contrast with #006400: 8.6:1 */
-        }
-        h2 {
-            font-size: 1.4em; /* ~18px, large text */
-            color: #000; /* Black, contrast with #f7f7f7: 21:1 */
-            border-bottom: 1px solid #d3d3d3;
-            padding-bottom: 5px;
-            margin: 20px 0 10px;
-        }
-        form {
-            background-color: #fff; /* White */
-            padding: 15px;
-            border: 1px solid #e0e0e0;
-            border-radius: 3px;
-            margin-bottom: 20px;
-            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
-        }
-        label {
-            font-weight: normal;
-            margin-right: 10px;
-            font-size: 0.9em; /* Small text, 4.5:1+ required */
-            color: #333; /* Contrast with #fff: 12.3:1 */
-        }
-        input[type="text"], textarea {
-            width: 100%;
-            padding: 6px;
-            margin: 5px 0 10px;
-            border: 1px solid #ccc;
-            border-radius: 2px;
-            font-family: 'Consolas', 'Courier New', monospace;
-            font-size: 13px; /* Small text */
-            box-sizing: border-box;
-            background-color: #fff;
-            color: #333; /* Contrast with #fff: 12.3:1 */
-        }
-        textarea {
-            height: 120px;
-            resize: vertical;
-        }
-        input[type="submit"] {
-            background-color: #3c8dbc; /* Blue */
-            color: #fff; /* White, contrast with #3c8dbc: 4.6:1 */
-            border: none;
-            padding: 6px 12px;
-            cursor: pointer;
-            border-radius: 2px;
-            font-size: 13px; /* Small text */
-            font-family: 'Verdana', sans-serif;
-        }
-        input[type="submit"]:hover {
-            background-color: #367fa9; /* Darker blue, contrast with #fff: 5.5:1 */
-        }
-        .c {
-            margin-bottom: 15px;
-        }
-        .e {
-            color: #c00; /* Red, contrast with #f7f7f7: 4.7:1 */
-            font-size: 0.9em;
-            margin: 10px 0;
-        }
-        .r, .b, .d {
-            background-color: #fff;
-            padding: 12px;
-            border: 1px solid #e0e0e0;
-            border-radius: 3px;
-            margin-top: 20px;
-            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
-        }
-        pre {
-            background-color: #f9f9f9; /* Very light gray */
-            padding: 8px;
-            border: 1px solid #e0e0e0;
-            border-radius: 2px;
-            font-family: 'Consolas', 'Courier New', monospace;
-            font-size: 12px; /* Small text */
-            white-space: pre-wrap;
-            overflow-x: auto;
-            color: #333; /* Contrast with #f9f9f9: 11.8:1 */
-        }
-        ul {
-            margin: 10px 0;
-            padding-left: 15px;
-            font-size: 0.9em; /* Small text */
-            color: #333; /* Contrast with #fff: 12.3:1 */
-        }
-        li {
-            margin-bottom: 5px;
-        }
-    </style>
+    <title>Code Plagiarism Detector</title>
+    <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
-    <form action="/a" method="post">
-        <h2>Analyze Code</h2>
-        <label>Handle: <input type="text" name="h" value="user1"></label><br>
-        <textarea name="c" placeholder="Paste your code here..."></textarea><br>
+    <h1>Code Plagiarism Detector</h1>
+    
+    <!-- Single Code Submission Form -->
+    <h2>Analyze Code</h2>
+    <form method="post" action="/a">
+        <label for="handle">Handle:</label><br>
+        <input type="text" id="handle" name="handle" value="triumph"><br>
+        <label for="code">Code:</label><br>
+        <textarea id="code" name="code" rows="20" cols="80"></textarea><br>
         <input type="submit" value="Analyze">
     </form>
-
+    
+    <!-- Display Errors -->
     {% if error %}
-        <div class="e">Error: {{ error }}</div>
+        <h3>Error</h3>
+        <p>{{ error }}</p>
     {% endif %}
-
+    
+    <!-- Display Single Result -->
     {% if result %}
-        <div class="r">
-            <h3>Handle: {{ result.handle }}</h3>
-            <p>Class: {{ result.label }}</p>
-            <p>Conf: {{ "%.2f" | format(result.confidence) }}%</p>
-            <pre>{{ result.report | safe }}</pre>
-        </div>
+        <h3>Result for {{ result.handle }}</h3>
+        <pre>{{ result.report }}</pre>
     {% endif %}
-
-    <form id="f" action="/c" method="post">
-        <h2>Compare Codes</h2>
-        <div id="p">
-            <div class="c">
-                <label>Handle 1: <input type="text" name="handle1" value="user1"></label><br>
-                <textarea name="code1" placeholder="First code..."></textarea><br>
-                <label>Handle 2: <input type="text" name="handle2" value="user2"></label><br>
-                <textarea name="code2" placeholder="Second code..."></textarea><br>
-            </div>
-        </div>
-        <button id="b" class="a" type="button" onclick="a()">+</button>
-        <br><br>
-        <input type="submit" value="Compare">
-    </form>
-
-    {% if batch_results %}
-        <div class="d">
-            <h2>Results</h2>
-            {% for item in batch_results %}
-                <div>
-                    <h3>{{ item.message }}</h3>
-                    <p>Evi:</p>
-                    <ul>
-                        {% for e in item.evidence %}
-                            <li>{{ e }}</li>
-                        {% endfor %}
-                    </ul>
-                    <pre>{{ item.report | safe }}</pre>
-                </div>
-            {% endfor %}
-        </div>
-    {% endif %}
-
-    <script>
-        let c = 1;
-        function a() {
-            c++;
-            const n = document.createElement('div');
-            n.classList.add('c');
-            n.innerHTML = `
-                <label>Handle ${c * 2 - 1}: <input type="text" name="handle${c * 2 - 1}" value="user${c * 2 - 1}"></label><br>
-                <textarea name="code${c * 2 - 1}" placeholder="Code ${c * 2 - 1}..."></textarea><br>
-                <label>Handle ${c * 2}: <input type="text" name="handle${c * 2}" value="user${c * 2}"></label><br>
-                <textarea name="code${c * 2}" placeholder="Code ${c * 2}..."></textarea><br>
-            `;
-            document.getElementById('p').appendChild(n);
-        }
-    </script>
+    
 </body>
 </html>
