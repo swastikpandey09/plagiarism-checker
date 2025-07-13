@@ -49,7 +49,7 @@ logging.basicConfig(level=getattr(logging, log_level), format="%(levelname)s | %
 logger = logging.getLogger(__name__)
 
 # LM Studio server URL (local or public tunnel)
-LM_STUDIO_URL = environ.get("LM_STUDIO_URL", "http://192.168.29.154:1234/v1")
+LM_STUDIO_URL = environ.get("LM_STUDIO_URL", "https://670sn0rg-1234.inc1.devtunnels.ms/v1")
 
 # Verify MODEL_ARCHIVE exists (for reference, not loaded)
 if not MODEL_ARCHIVE.exists():
