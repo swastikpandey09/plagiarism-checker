@@ -5,21 +5,20 @@ import hashlib
 import logging
 from pathlib import Path
 from typing import List, Tuple, Dict, Any, Optional
-import asyncio
+import requests
 import numpy as np
 from fastapi import FastAPI, Form, Request
 from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, validator
-from openai import AsyncOpenAI
 import py7zr
 import tempfile
 import shutil
 from os import environ
 
 # Initialize FastAPI app
-app = FastAPI(title="Code Plagiarism Detector")
+app = FastAPI(title="Code Plagiarism Detector", version="0.1.0")
 
 # Configuration
 BASE_DIR = Path(__file__).resolve().parent
@@ -49,11 +48,8 @@ if log_level not in valid_log_levels:
 logging.basicConfig(level=getattr(logging, log_level), format="%(levelname)s | %(asctime)s | %(message)s")
 logger = logging.getLogger(__name__)
 
-# Initialize dependencies
-openai_client = AsyncOpenAI(
-    base_url=environ.get("LM_STUDIO_URL", "https://670sn0rg-1234.inc1.devtunnels.ms/v1"),
-    api_key="not-needed"
-)
+# LM Studio server URL (local or public tunnel)
+LM_STUDIO_URL = environ.get("LM_STUDIO_URL", "http://192.168.29.154:1234/v1")
 
 # Verify MODEL_ARCHIVE exists (for reference, not loaded)
 if not MODEL_ARCHIVE.exists():
@@ -77,17 +73,27 @@ class SingleCodeInput(BaseModel):
             raise ValueError("Handle must be alphanumeric or underscores")
         return v
 
+class HealthResponse(BaseModel):
+    status: str
+    models: List[str]
+
+class ValidationError(BaseModel):
+    loc: List[str]
+    msg: str
+    type: str
+
+class HTTPValidationError(BaseModel):
+    detail: List[ValidationError]
+
 @app.on_event("startup")
 async def startup_event():
     try:
-        await openai_client.chat.completions.create(
-            model="gemma-3-12b-it",
-            messages=[{"role": "user", "content": "Test"}],
-            max_tokens=10
-        )
-        logger.info("OpenAI client initialized successfully")
-    except Exception as e:
-        logger.error(f"Startup failed: {str(e)}")
+        # Test LM Studio API health
+        response = requests.get(f"{LM_STUDIO_URL}/models", timeout=10)
+        response.raise_for_status()
+        logger.info("LM Studio API health check passed")
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Startup failed: LM Studio API unavailable - {str(e)}")
         raise RuntimeError(f"Startup failed: {str(e)}")
 
 @app.on_event("shutdown")
@@ -120,7 +126,7 @@ def tokenize_code(line: str) -> List[str]:
     return re.findall(r'[a-zA-Z_][a-zA-Z0-9_]*|[{}();,=<>+\-*&]|[0-9]+', line)
 
 def extract_variables(code: str) -> Tuple[List[str], bool]:
-    primitives = {"int", "long", "short", "float", "double", "ch", "bool", "void", "auto", "unsigned", "signed", "size_t"}
+    primitives = {"int", "long", "short", "float", "double", "char", "bool", "void", "auto", "unsigned", "signed", "size_t"}
     containers = {"vector", "stack", "queue", "deque", "map", "set", "pair", "string"}
     keywords = {"main", "first", "second", "top", "push", "pop", "begin", "end", "size", "clear", "empty", "insert", "erase", "find", "sort", "reverse"}
     variables = set()
@@ -235,7 +241,7 @@ def compute_hash(text: str, by_line: bool = True) -> List[int]:
     if not text:
         return []
     segments = text.splitlines() if by_line else [text]
-    hashes = [int(hashlib.sha256(segment.encode()).hexdigest(), 16) % (2**64) 
+    hashes = [int(hashlib.sha256(segment.encode()).hexdigest(), 16) % (2**64)
               for segment in segments if segment.strip()]
     return sorted(hashes)
 
@@ -261,24 +267,28 @@ def compare_codes(code1: str, code2: str) -> Tuple[bool, str]:
     lcs_ratio = lcs_score / min(len(code1_clean), len(code2_clean)) if code1_clean and code2_clean else 0
     return lcs_ratio >= CONFIG["lcs_threshold"], f"LCS: {lcs_ratio:.2f}"
 
-async def query_api(messages: str, model: str = "gemma-3-12b-it", temp: float = 0.7, max_tokens: int = -1) -> str:
+def query_api(messages: List[Dict[str, str]], model: str = "gemma-3-12b-it", temp: float = 0.7, max_tokens: int = 2000) -> str:
     try:
-        messages_list = json.loads(messages)
-        messages_dicts = [dict(msg) for msg in messages_list]
-        logger.debug(f"Sending API request with messages: {messages_dicts}")
+        logger.debug(f"Sending API request with messages: {messages}")
         payload = {
             "model": model,
-            "messages": messages_dicts,
-            "temperature": temp
+            "messages": messages,
+            "temperature": temp,
+            "max_tokens": max_tokens
         }
-        if max_tokens > 0:
-            payload["max_tokens"] = max_tokens
-        response = await openai_client.chat.completions.create(**payload)
-        content = response.choices[0].message.content
+        response = requests.post(
+            f"{LM_STUDIO_URL}/chat/completions",
+            json=payload,
+            headers={"Content-Type": "application/json"},
+            timeout=60
+        )
+        response.raise_for_status()
+        result = response.json()
+        content = result.get("choices", [{}])[0].get("message", {}).get("content", "")
         logger.debug(f"API response: {content[:100]}...")
         match = re.search(r"```cpp\n(.*?)```", content, re.DOTALL)
         return match.group(1).strip() if match else ""
-    except Exception as e:
+    except requests.exceptions.RequestException as e:
         logger.error(f"API query failed: {str(e)}")
         return ""
 
@@ -310,8 +320,7 @@ async def classify_code(code: str, handle: str) -> Tuple[bool, str, float, str]:
         {"role": "user", "content": code}
     ]
     try:
-        hashable_messages = json.dumps([tuple(sorted(d.items())) for d in messages])
-        generated = await query_api(hashable_messages)
+        generated = query_api(messages)
         if not generated:
             return False, "No code generated by API", 0.0, handle
         is_similar = compare_codes(cleaned, clean_code(generated))[0]
@@ -319,6 +328,7 @@ async def classify_code(code: str, handle: str) -> Tuple[bool, str, float, str]:
     except Exception as e:
         logger.error(f"Code classification failed: {str(e)}")
         return False, f"Classification error: {str(e)}", 0.0, handle
+
 def process_code_submission(code: str, handle: str):
     try:
         if INPUT_1568.exists():
@@ -399,7 +409,10 @@ def generate_report(analysis: Dict[str, Any], issues: List[str], handle: str,
 async def get_index(request: Request):
     return templates.TemplateResponse("index.html", {"request": request})
 
-@app.post("/a", response_class=HTMLResponse)
+@app.post("/a", response_class=HTMLResponse, responses={
+    200: {"content": {"text/html": {}}},
+    422: {"model": HTTPValidationError}
+})
 async def analyze_code_form(request: Request, code: str = Form(..., max_length=100_000), handle: str = Form("triumph")):
     try:
         if not code.strip():
@@ -429,8 +442,7 @@ async def analyze_code_form(request: Request, code: str = Form(..., max_length=1
             {"role": "system", "content": "Generate C++ code that matches the functionality of the given code."},
             {"role": "user", "content": code}
         ]
-        hashable_messages = json.dumps([tuple(sorted(d.items())) for d in messages])
-        generated = await query_api(hashable_messages)
+        generated = query_api(messages)
         if not generated:
             return templates.TemplateResponse("index.html", {"request": request, "error": "Failed to generate code from API"})
         
@@ -455,12 +467,14 @@ async def analyze_code_form(request: Request, code: str = Form(..., max_length=1
         logger.error(f"Analyze form endpoint failed: {str(e)}")
         return templates.TemplateResponse("index.html", {"request": request, "error": str(e)})
 
-@app.get("/health")
+@app.get("/health", response_model=HealthResponse)
 async def health_check():
     try:
-        response = await openai_client.models.list()
-        return {"status": "healthy", "models": [model.id for model in response.data]}
-    except Exception as e:
+        response = requests.get(f"{LM_STUDIO_URL}/models", timeout=10)
+        response.raise_for_status()
+        models = response.json().get("data", [])
+        return {"status": "healthy", "models": [model["id"] for model in models]}
+    except requests.exceptions.RequestException as e:
         logger.error(f"Health check failed: {str(e)}")
         return {"status": "unhealthy", "error": str(e)}
 
