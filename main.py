@@ -306,7 +306,7 @@ async def classify_code(code: str, handle: str) -> Tuple[bool, str, float, str]:
         return False, "Code cannot be empty", 0.0, handle
     cleaned = clean_code(code)
     messages = [
-        {"role": "system content": "Generate C++ code that matches the functionality of the given code."},
+        {"role": "system", "content": "Generate C++ code that matches the functionality of the given code."},
         {"role": "user", "content": code}
     ]
     try:
@@ -319,7 +319,6 @@ async def classify_code(code: str, handle: str) -> Tuple[bool, str, float, str]:
     except Exception as e:
         logger.error(f"Code classification failed: {str(e)}")
         return False, f"Classification error: {str(e)}", 0.0, handle
-
 def process_code_submission(code: str, handle: str):
     try:
         if INPUT_1568.exists():
