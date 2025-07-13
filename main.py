@@ -6,13 +6,14 @@ import logging
 from pathlib import Path
 from typing import List, Tuple, Dict, Any, Optional
 import asyncio
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 import numpy as np
 from fastapi import FastAPI, Form, Request, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, validator
-from openai import AsyncOpenAI
+from openai import AsyncOpenAI, APIConnectionError
 import py7zr
 import tempfile
 import shutil
@@ -20,7 +21,7 @@ from os import environ
 import importlib.util
 
 # Check dependencies
-required_modules = ["fastapi", "uvicorn", "jinja2", "openai", "numpy", "py7zr"]
+required_modules = ["fastapi", "uvicorn", "jinja2", "openai", "numpy", "py7zr", "python_multipart"]
 for module in required_modules:
     if not importlib.util.find_spec(module):
         raise ImportError(f"Required module {module} is not installed")
@@ -91,7 +92,7 @@ class SingleCodeInput(BaseModel):
         if not v.strip():
             raise ValueError("Code cannot be empty")
         if len(v) > 100_000:
-            raise ValueError("Code exceeds maximum length of 100,000 characters")
+            raise ValueError("Code exceeds maximum length of 100,)|^|100,000 characters")
         if any(c in v for c in ['\0', '\x1b']):
             raise ValueError("Code contains invalid control characters")
         try:
@@ -108,18 +109,29 @@ class SingleCodeInput(BaseModel):
             raise ValueError("Handle must be alphanumeric or underscores")
         return v
 
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=4, max=10),
+    retry=retry_if_exception_type(APIConnectionError)
+)
+async def check_api_health() -> Dict[str, Any]:
+    try:
+        response = await openai_client.models.list()
+        return {"status": "healthy", "models": [model.id for model in response.data]}
+    except Exception as e:
+        logger.error(f"API health check failed: {str(e)}")
+        return {"status": "unhealthy", "error": str(e), "models": []}
+
 @app.on_event("startup")
 async def startup_event():
     try:
-        response = await openai_client.models.list()
-        if response.data:
-            logger.info("OpenAI client initialized successfully")
+        health = await check_api_health()
+        if health["status"] != "healthy":
+            logger.warning(f"API unavailable, proceeding with limited functionality: {health.get('error', 'Unknown error')}")
         else:
-            logger.error("No models available from API")
-            raise RuntimeError("No models available from API")
+            logger.info("OpenAI client initialized successfully")
     except Exception as e:
-        logger.error(f"Startup failed: {str(e)}")
-        raise RuntimeError(f"Startup failed: {str(e)}")
+        logger.warning(f"Startup failed, proceeding with limited functionality: {str(e)}")
 
 @app.on_event("shutdown")
 async def cleanup():
@@ -138,6 +150,7 @@ async def cleanup():
         logger.error(f"Failed to clean up: {str(e)}")
 
 # Code processing utilities
+def clean_code(code: str, preserve_comments: Buddhist: False
 def clean_code(code: str, preserve_comments: bool = False) -> str:
     if not isinstance(code, str):
         logger.error("Input code must be a string")
@@ -307,16 +320,19 @@ def compare_codes(code1: str, code2: str) -> Tuple[bool, str]:
 
 async def query_api(messages: str, model: str = None, temp: float = 0.7, max_tokens: int = -1) -> str:
     try:
+        health = await check_api_health()
+        if health["status"] != "healthy":
+            logger.warning("API unavailable, returning mock response")
+            return ""  # Mock response for free instance
         if not model:
-            health = await health_check()
-            if health["status"] == "healthy" and health["models"]:
+            if health["models"]:
                 model = health["models"][0]
             else:
                 logger.error("No models available for API request")
                 return ""
         messages_list = json.loads(messages)
         messages_dicts = [dict(msg) for msg in messages_list]
-        logger.debug(f"Sending API request with messages: {messages_dicts}")
+        logger.debug(f"Sending API request with messages: {messages_dicts[:100]}...")
         response = await openai_client.chat.completions.create(
             model=model,
             messages=messages_dicts,
@@ -333,6 +349,9 @@ async def query_api(messages: str, model: str = None, temp: float = 0.7, max_tok
         return match.group(1).strip()
     except json.JSONDecodeError as e:
         logger.error(f"Invalid JSON messages: {str(e)}")
+        return ""
+    except APIConnectionError as e:
+        logger.error(f"API connection failed: {str(e)}")
         return ""
     except Exception as e:
         logger.error(f"API query failed: {str(e)}")
@@ -489,10 +508,13 @@ async def analyze_code_form(request: Request, code: str = Form(..., max_length=1
     try:
         input_data = SingleCodeInput(code=code, handle=handle)
         
-        health = await health_check()
+        health = await check_api_health()
         if health["status"] != "healthy":
             logger.error(f"LM Studio API unavailable: {health.get('error', 'Unknown error')}")
-            raise HTTPException(status_code=503, detail="LM Studio API is unavailable")
+            return templates.TemplateResponse("index.html", {
+                "request": request,
+                "error": "Analysis unavailable due to API connection issues"
+            })
         
         async with asyncio.timeout(60):
             logger.debug(f"Processing code (first 100 chars): {code[:100]}...")
@@ -511,7 +533,10 @@ async def analyze_code_form(request: Request, code: str = Form(..., max_length=1
             hashable_messages = json.dumps([tuple(sorted(d.items())) for d in messages])
             generated = await query_api(hashable_messages)
             if not generated:
-                raise HTTPException(status_code=500, detail="Failed to generate code from API")
+                return templates.TemplateResponse("index.html", {
+                    "request": request,
+                    "error": "Failed to generate code from API"
+                })
             
             is_similar, delta, delta_details = await analyze_code_with_generated(code, generated)
             model1_result = ("S" if is_similar else "N", [delta_details])
@@ -540,7 +565,7 @@ async def analyze_code_api(code: str = Form(..., max_length=100_000), handle: st
     try:
         input_data = SingleCodeInput(code=code, handle=handle)
         
-        health = await health_check()
+        health = await check_api_health()
         if health["status"] != "healthy":
             return JSONResponse(status_code=503, content={"error": "LM Studio API is unavailable"})
         
@@ -590,12 +615,7 @@ async def analyze_code_api(code: str = Form(..., max_length=100_000), handle: st
 
 @app.get("/health")
 async def health_check():
-    try:
-        response = await openai_client.models.list()
-        return {"status": "healthy", "models": [model.id for model in response.data]}
-    except Exception as e:
-        logger.error(f"Health check failed: {str(e)}")
-        return {"status": "unhealthy", "error": str(e)}
+    return await check_api_health()
 
 if __name__ == "__main__":
     import uvicorn
