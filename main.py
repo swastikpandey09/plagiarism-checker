@@ -49,7 +49,7 @@ logging.basicConfig(level=getattr(logging, log_level), format="%(levelname)s | %
 logger = logging.getLogger(__name__)
 
 # LM Studio server URL (local or public tunnel)
-LM_STUDIO_URL = environ.get("LM_STUDIO_URL", "https://670sn0rg-1234.inc1.devtunnels.ms/v1")
+LM_STUDIO_URL = environ.get("LM_STUDIO_URL", "http://192.168.29.154:1234/v1")
 
 # Verify MODEL_ARCHIVE exists (for reference, not loaded)
 if not MODEL_ARCHIVE.exists():
@@ -269,7 +269,7 @@ def compare_codes(code1: str, code2: str) -> Tuple[bool, str]:
 
 def query_api(messages: List[Dict[str, str]], model: str = "gemma-3-12b-it", temp: float = 0.7, max_tokens: int = 2000) -> str:
     try:
-        logger.debug(f"Sending API request with messages: {messages}")
+        logger.debug(f"Sending API request to {LM_STUDIO_URL}/chat/completions with messages: {messages}")
         payload = {
             "model": model,
             "messages": messages,
@@ -287,7 +287,13 @@ def query_api(messages: List[Dict[str, str]], model: str = "gemma-3-12b-it", tem
         content = result.get("choices", [{}])[0].get("message", {}).get("content", "")
         logger.debug(f"API response: {content[:100]}...")
         match = re.search(r"```cpp\n(.*?)```", content, re.DOTALL)
-        return match.group(1).strip() if match else ""
+        if not match:
+            logger.error("No valid C++ code found in API response")
+            return ""
+        return match.group(1).strip()
+    except requests.exceptions.HTTPError as e:
+        logger.error(f"API query failed with HTTP error: {str(e)} - Status: {e.response.status_code} - Details: {e.response.text}")
+        return ""
     except requests.exceptions.RequestException as e:
         logger.error(f"API query failed: {str(e)}")
         return ""
@@ -316,7 +322,7 @@ async def classify_code(code: str, handle: str) -> Tuple[bool, str, float, str]:
         return False, "Code cannot be empty", 0.0, handle
     cleaned = clean_code(code)
     messages = [
-        {"role": "system", "content": "Generate C++ code that matches the functionality of the given code."},
+        {"role": "system", "content": "Generate C++ code that matches the functionality of the given code. Ensure the code is complete and syntactically correct."},
         {"role": "user", "content": code}
     ]
     try:
@@ -439,7 +445,7 @@ async def analyze_code_form(request: Request, code: str = Form(..., max_length=1
         
         # Call query_api once
         messages = [
-            {"role": "system", "content": "Generate C++ code that matches the functionality of the given code."},
+            {"role": "system", "content": "Generate C++ code that matches the functionality of the given code. Ensure the code is complete and syntactically correct."},
             {"role": "user", "content": code}
         ]
         generated = query_api(messages)
