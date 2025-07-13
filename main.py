@@ -7,7 +7,6 @@ from pathlib import Path
 from typing import List, Tuple, Dict, Any, Optional
 import asyncio
 import numpy as np
-import spacy
 from fastapi import FastAPI, Form, Request
 from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
@@ -51,17 +50,16 @@ logging.basicConfig(level=getattr(logging, log_level), format="%(levelname)s | %
 logger = logging.getLogger(__name__)
 
 # Initialize dependencies
-nlp = None
 openai_client = AsyncOpenAI(
     base_url=environ.get("LM_STUDIO_URL", "https://670sn0rg-1234.inc1.devtunnels.ms/v1"),
     api_key="not-needed"
 )
 
-# Verify MODEL_ARCHIVE exists
+# Verify MODEL_ARCHIVE exists (for reference, not loaded)
 if not MODEL_ARCHIVE.exists():
-    logger.critical("Model archive %s not found", MODEL_ARCHIVE)
-    raise RuntimeError(f"Model archive {MODEL_ARCHIVE} not found")
-logger.info("Confirmed model.7z exists at %s", MODEL_ARCHIVE)
+    logger.warning("Model archive %s not found, skipping spaCy model loading", MODEL_ARCHIVE)
+else:
+    logger.info("Confirmed model.7z exists at %s, but skipping spaCy due to memory constraints", MODEL_ARCHIVE)
 
 # Mount static files and templates
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
@@ -81,52 +79,7 @@ class SingleCodeInput(BaseModel):
 
 @app.on_event("startup")
 async def startup_event():
-    global nlp
     try:
-        source_model_path = BASE_DIR / "dataset" / "output" / "model-best"
-        model_path = TEMP_MODEL_DIR / "model-best"
-        if not source_model_path.exists():
-            logger.error(f"Source model directory {source_model_path} does not exist")
-            raise RuntimeError(f"Source model directory {source_model_path} does not exist")
-        if not (source_model_path / "config.cfg").exists():
-            logger.error(f"config.cfg not found in source directory {source_model_path}")
-            raise RuntimeError(f"config.cfg not found in source directory {source_model_path}")
-        logger.info(f"Copying {source_model_path} to {model_path}")
-        shutil.copytree(source_model_path, model_path, dirs_exist_ok=True)
-        if not (model_path / "config.cfg").exists():
-            logger.error(f"config.cfg not found in {model_path} after copying")
-            raise RuntimeError(f"config.cfg not found in {model_path} after copying")
-        transformer_archive = model_path / "transformer" / "model.7z"
-        if transformer_archive.exists():
-            logger.info(f"Extracting {transformer_archive} to {model_path / 'transformer'}")
-            with py7zr.SevenZipFile(transformer_archive, 'r') as archive:
-                archive.extractall(path=model_path / "transformer")
-            transformer_archive.unlink()
-        else:
-            logger.error(f"Transformer archive {transformer_archive} not found")
-            raise RuntimeError(f"Transformer archive {transformer_archive} not found")
-        required_files = [
-            "config.cfg",
-            "tokenizer",
-            "textcat/cfg",
-            "textcat/model",
-            "transformer/cfg",
-            "vocab/strings.json"
-        ]
-        for file in required_files:
-            if not (model_path / file).exists():
-                logger.error(f"Missing required file: {model_path / file}")
-                raise RuntimeError(f"Invalid spaCy model at {model_path}. Missing {file}")
-        try:
-            import spacy_transformers
-            nlp = spacy.load(model_path)
-            logger.info(f"Loaded spaCy model with transformer support from {model_path}")
-        except ImportError:
-            logger.warning("spacy-transformers not installed, falling back to non-transformer classification")
-            nlp = None
-        except Exception as e:
-            logger.error(f"Failed to load spaCy model: {str(e)}")
-            nlp = None
         await openai_client.chat.completions.create(
             model="gemma-3-12b-it",
             messages=[{"role": "user", "content": "Test"}],
@@ -350,16 +303,20 @@ async def classify_code(code: str, handle: str) -> Tuple[bool, str, float, str]:
     if not code.strip():
         return False, "E", 0.0, handle
     cleaned = clean_code(code)
-    if nlp:
-        try:
-            doc = nlp(cleaned)
-            ai_conf, human_conf = doc.cats.get("AI", 0.0), doc.cats.get("HUMAN", 0.0)
-            conf = max(ai_conf, human_conf)
-            label = "H" if human_conf >= 0.95 else "AI"
-            return True, label, conf, handle
-        except Exception as e:
-            logger.error(f"spaCy processing failed: {str(e)}")
-    return False, "E", 0.0, handle
+    messages = [
+        {"role": "system", "content": "Generate C++ code that matches the functionality of the given code."},
+        {"role": "user", "content": code}
+    ]
+    try:
+        hashable_messages = json.dumps([tuple(sorted(d.items())) for d in messages])
+        generated = await query_api(hashable_messages)
+        if not generated:
+            return False, "E", 0.0, handle
+        is_similar = compare_codes(cleaned, clean_code(generated))[0]
+        return True, "H" if is_similar else "AI", 0.0, handle
+    except Exception as e:
+        logger.error(f"Code classification failed: {str(e)}")
+        return False, "E", 0.0, handle
 
 def process_code_submission(code: str, handle: str):
     try:
@@ -509,4 +466,4 @@ async def health_check():
 if __name__ == "__main__":
     import uvicorn
     port = int(environ.get("PORT", 10000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    uvicorn.run(app, host="0.0.0.0", port=port, reload=False)
