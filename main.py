@@ -18,13 +18,20 @@ from os import environ
 from openai import OpenAI, APIError, RateLimitError, AuthenticationError
 from dotenv import load_dotenv
 from os import getenv
+import requests
+import time
+import datetime
 
 # Load environment variables
 load_dotenv()
 
 # Initialize OpenAI client with OpenRouter credentials
+env_base_url = getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
+correct_base_url = env_base_url if env_base_url.endswith("/v1") else "https://openrouter.ai/api/v1"
+if env_base_url != correct_base_url:
+    logging.warning(f"Environment OPENROUTER_BASE_URL ({env_base_url}) overridden with {correct_base_url}")
 client = OpenAI(
-    base_url=getenv("OPENROUTER_BASE_URL"),
+    base_url=correct_base_url,
     api_key=getenv("OPENROUTER_API_KEY"),
 )
 
@@ -93,27 +100,54 @@ class ValidationError(BaseModel):
 class HTTPValidationError(BaseModel):
     detail: List[ValidationError]
 
+# Helper function to check OpenRouter API health and get available models
+def check_openrouter_health(api_key: str, base_url: str = "https://openrouter.ai/api/v1") -> Tuple[bool, List[str]]:
+    try:
+        env_base_url = getenv("OPENROUTER_BASE_URL")
+        if env_base_url and env_base_url != base_url:
+            logger.warning(f"Environment OPENROUTER_BASE_URL ({env_base_url}) overridden with {base_url}")
+        endpoint = f"{base_url.rstrip('/')}/models"
+        logger.debug(f"Checking OpenRouter API health at: {endpoint}")
+        headers = {"Authorization": f"Bearer {api_key}"}
+        response = requests.get(endpoint, headers=headers, timeout=5)
+        response.raise_for_status()
+        data = response.json()
+        if "data" in data and isinstance(data["data"], list):
+            model_ids = [model["id"] for model in data["data"]]
+            logger.info("OpenRouter API health check passed")
+            return True, model_ids
+        else:
+            logger.error("OpenRouter API response does not contain valid model list")
+            return False, []
+    except requests.exceptions.HTTPError as e:
+        logger.error(f"OpenRouter API health check failed: HTTP {e.response.status_code} - {str(e)}")
+        return False, []
+    except requests.exceptions.RequestException as e:
+        logger.error(f"OpenRouter API health check failed: {str(e)}")
+        return False, []
+    except ValueError as e:
+        logger.error(f"OpenRouter API health check failed: Invalid JSON response - {str(e)}")
+        return False, []
+
 # Startup and shutdown events
 @app.on_event("startup")
 async def startup_event():
     # Validate environment variables
-    if not getenv("OPENROUTER_API_KEY"):
+    api_key = getenv("OPENROUTER_API_KEY")
+    base_url = "https://openrouter.ai/api/v1"
+    env_base_url = getenv("OPENROUTER_BASE_URL")
+    logger.debug(f"Environment OPENROUTER_BASE_URL: {env_base_url}, using: {base_url}")
+    if not api_key:
         logger.error("OPENROUTER_API_KEY environment variable is not set")
         raise RuntimeError("OPENROUTER_API_KEY environment variable is not set")
-    if not getenv("OPENROUTER_BASE_URL"):
-        logger.error("OPENROUTER_BASE_URL environment variable is not set")
-        raise RuntimeError("OPENROUTER_BASE_URL environment variable is not set")
-    
-    try:
-        # Test OpenRouter API health
-        client.models.list()
-        logger.info("OpenRouter API health check passed")
-    except AuthenticationError as e:
-        logger.error(f"Startup failed: Invalid OpenRouter API key - {str(e)}")
-        raise RuntimeError(f"Startup failed: Invalid OpenRouter API key - {str(e)}")
-    except Exception as e:
-        logger.error(f"Startup failed: OpenRouter API unavailable - {str(e)}")
-        raise RuntimeError(f"Startup failed: OpenRouter API unavailable - {str(e)}")
+    # Test OpenRouter API health
+    is_healthy, models = check_openrouter_health(api_key, base_url)
+    if not is_healthy:
+        logger.error("Startup failed: OpenRouter API unavailable")
+        raise RuntimeError("Startup failed: OpenRouter API unavailable")
+    # Store available models for use in query_api
+    app.state.available_models = models
+    logger.info(f"Available models: {models}")
 
 @app.on_event("shutdown")
 async def cleanup():
@@ -128,48 +162,183 @@ async def cleanup():
     except Exception as e:
         logger.error(f"Failed to clean up: {str(e)}")
 
-# Updated query_api function with enhanced error handling
-def query_api(messages: List[Dict[str, str]], model: str = "deepseek/deepseek-r1-0528", temp: float = 0.7, max_tokens: int = 2000) -> str:
-    try:
-        logger.debug(f"Sending API request to OpenRouter with model {model} and messages: {messages}")
-        response = client.chat.completions.create(
-            model=model,
-            messages=messages,
-            temperature=temp,
-            max_tokens=max_tokens
-        )
-        content = response.choices[0].message.content.strip()
-        logger.debug(f"Raw API response: {content[:200]}...")  # Log first 200 chars of response
-        match = re.search(r"```cpp\n(.*?)```", content, re.DOTALL)
-        if not match:
-            logger.error(f"No valid C++ code block found in API response: {content[:500]}...")
+# Query API function with enhanced error handling and fallback
+def query_api(messages: List[Dict[str, str]], model: str = None, temp: float = 0.7, max_tokens: int = 2000) -> str:
+    # Use a default model from available models if not specified
+    if not model:
+        available_models = getattr(app.state, "available_models", [])
+        model = next((m for m in available_models if m == "deepseek/deepseek-r1-0528:free"), "deepseek/deepseek-r1-0528:free")
+        logger.debug(f"No model specified, using: {model}")
+    
+    fallback_model = "qwen/qwen3-8b:free"  # Fallback model if primary fails
+    models_to_try = [model, fallback_model]
+    
+    for current_model in models_to_try:
+        try:
+            logger.debug(f"Sending API request to OpenRouter with model {current_model} and messages: {json.dumps(messages)[:100]}...")
+            request_url = f"{str(client.base_url).rstrip('/')}/chat/completions"
+            logger.debug(f"Request URL: {request_url}")
+            response = client.chat.completions.create(
+                model=current_model,
+                messages=messages,
+                temperature=temp,
+                max_tokens=max_tokens,
+                response_format={"type": "json_object"}
+            )
+            # Log response type
+            logger.debug(f"Response type: {type(response).__name__}")
+            content = response.choices[0].message.content.strip()
+            logger.debug(f"Raw API response: {content[:500]}...")
+            try:
+                parsed = json.loads(content)
+                code = parsed.get("code", "")
+                if not code:
+                    logger.error(f"No 'code' field in JSON response: {content[:1000]}")
+                    # Try regex as fallback
+                    match = re.search(r"```cpp\n(.*?)```", content, re.DOTALL)
+                    if match:
+                        return match.group(1).strip()
+                    logger.error(f"No valid C++ code block found in API response: {content[:1000]}")
+                    return content.strip()  # Return raw content as last resort
+                return code.strip()
+            except json.JSONDecodeError:
+                logger.error(f"Failed to parse JSON response: {content[:1000]}")
+                match = re.search(r"```cpp\n(.*?)```", content, re.DOTALL)
+                if not match:
+                    logger.error(f"No valid C++ code block found in API response: {content[:1000]}")
+                    return content.strip()  # Return raw content as last resort
+                return match.group(1).strip()
+        except APIError as e:
+            if ("404" in str(e) or "429" in str(e)) and current_model != fallback_model:
+                error_data = getattr(e, 'response', None)
+                delay = 60.0  # Default delay in seconds
+                if error_data and "429" in str(e):
+                    try:
+                        error_json = error_data.json()
+                        reset_time = int(error_json.get('error', {}).get('metadata', {}).get('headers', {}).get('X-RateLimit-Reset', 0))
+                        if reset_time:
+                            current_time = int(time.time() * 1000) / 1000  # Current time in seconds
+                            delay = max((reset_time / 1000) - current_time, 0) + 1  # Add 1 second buffer
+                        logger.warning(f"Rate limit headers: Limit={error_json.get('error', {}).get('metadata', {}).get('headers', {}).get('X-RateLimit-Limit', 'N/A')}, "
+                                      f"Remaining={error_json.get('error', {}).get('metadata', {}).get('headers', {}).get('X-RateLimit-Remaining', 'N/A')}, "
+                                      f"Reset={error_json.get('error', {}).get('metadata', {}).get('headers', {}).get('X-RateLimit-Reset', 'N/A')}")
+                    except (ValueError, AttributeError) as parse_err:
+                        logger.error(f"Failed to parse rate limit headers: {str(parse_err)}")
+                logger.warning(f"API error with model {current_model}: {str(e)}. Waiting {delay:.2f}s before retrying with fallback model {fallback_model}")
+                time.sleep(delay)
+                continue  # Try the fallback model
+            logger.error(f"OpenRouter API error with model {current_model}: {str(e)}")
             return ""
-        return match.group(1).strip()
-    except AuthenticationError as e:
-        logger.error(f"Authentication failed: Invalid OpenRouter API key - {str(e)}")
-        return ""
-    except RateLimitError as e:
-        logger.error(f"Rate limit exceeded for OpenRouter API - {str(e)}")
-        return ""
-    except APIError as e:
-        logger.error(f"OpenRouter API error: {str(e)}")
-        return ""
-    except Exception as e:
-        logger.error(f"Unexpected error in API query: {str(e)}")
-        return ""
+        except AuthenticationError as e:
+            logger.error(f"Authentication failed: Invalid OpenRouter API key - {str(e)}")
+            return ""
+        except RateLimitError as e:
+            if current_model != fallback_model:
+                delay = 60.0  # Default delay
+                try:
+                    error_json = e.response.json()
+                    reset_time = int(error_json.get('error', {}).get('metadata', {}).get('headers', {}).get('X-RateLimit-Reset', 0))
+                    if reset_time:
+                        current_time = int(time.time() * 1000) / 1000
+                        delay = max((reset_time / 1000) - current_time, 0) + 1
+                    logger.warning(f"Rate limit headers: Limit={error_json.get('error', {}).get('metadata', {}).get('headers', {}).get('X-RateLimit-Limit', 'N/A')}, "
+                                  f"Remaining={error_json.get('error', {}).get('metadata', {}).get('headers', {}).get('X-RateLimit-Remaining', 'N/A')}, "
+                                  f"Reset={error_json.get('error', {}).get('metadata', {}).get('headers', {}).get('X-RateLimit-Reset', 'N/A')}")
+                except (ValueError, AttributeError) as parse_err:
+                    logger.error(f"Failed to parse rate limit headers: {str(parse_err)}")
+                logger.warning(f"Rate limit exceeded for model {current_model}: {str(e)}. Waiting {delay:.2f}s before retrying with fallback model {fallback_model}")
+                time.sleep(delay)
+                continue
+            logger.error(f"Rate limit exceeded for OpenRouter API with model {current_model}: {str(e)}")
+            return ""
+        except Exception as e:
+            logger.error(f"Unexpected error in API query with model {current_model}: {str(e)}")
+            # Fallback to direct HTTP request
+            try:
+                headers = {
+                    "Authorization": f"Bearer {getenv('OPENROUTER_API_KEY')}",
+                    "Content-Type": "application/json"
+                }
+                payload = {
+                    "model": current_model,
+                    "messages": messages,
+                    "temperature": temp,
+                    "max_tokens": max_tokens,
+                    "response_format": {"type": "json_object"}
+                }
+                http_response = requests.post(request_url, headers=headers, json=payload, timeout=10)
+                logger.debug(f"Fallback HTTP status: {http_response.status_code}")
+                logger.debug(f"Fallback HTTP headers: {http_response.headers}")
+                logger.debug(f"Fallback HTTP response: {http_response.text[:1000]}...")
+                if http_response.status_code == 200:
+                    try:
+                        data = http_response.json()
+                        content = data['choices'][0]['message']['content'].strip()
+                        logger.debug(f"Fallback raw response: {content[:1000]}...")
+                        try:
+                            parsed = json.loads(content)
+                            code = parsed.get("code", "")
+                            if not code:
+                                logger.error(f"No 'code' field in fallback JSON response: {content[:1000]}")
+                                match = re.search(r"```cpp\n(.*?)```", content, re.DOTALL)
+                                if match:
+                                    return match.group(1).strip()
+                                logger.error(f"No valid C++ code block in fallback response: {content[:1000]}")
+                                return content.strip()  # Return raw content as last resort
+                            return code.strip()
+                        except json.JSONDecodeError:
+                            logger.error(f"Failed to parse fallback JSON response: {content[:1000]}")
+                            match = re.search(r"```cpp\n(.*?)```", content, re.DOTALL)
+                            if not match:
+                                logger.error(f"No valid C++ code block in fallback response: {content[:1000]}")
+                                return content.strip()  # Return raw content as last resort
+                            return match.group(1).strip()
+                    except Exception as e:
+                        logger.error(f"Failed to parse fallback response: {str(e)}")
+                        return ""
+                elif (http_response.status_code == 404 or http_response.status_code == 429) and current_model != fallback_model:
+                    delay = 60.0
+                    if http_response.status_code == 429:
+                        reset_time = int(http_response.headers.get('X-RateLimit-Reset', 0))
+                        if reset_time:
+                            current_time = int(time.time() * 1000) / 1000
+                            delay = max((reset_time / 1000) - current_time, 0) + 1
+                        logger.warning(f"Fallback rate limit headers: Limit={http_response.headers.get('X-RateLimit-Limit', 'N/A')}, "
+                                      f"Remaining={http_response.headers.get('X-RateLimit-Remaining', 'N/A')}, "
+                                      f"Reset={http_response.headers.get('X-RateLimit-Reset', 'N/A')}")
+                    logger.warning(f"Fallback HTTP {http_response.status_code} with model {current_model}: {http_response.text[:1000]}. Waiting {delay:.2f}s before retrying with fallback model {fallback_model}")
+                    time.sleep(delay)
+                    continue  # Try the fallback model
+                else:
+                    logger.error(f"Fallback HTTP request failed with status {http_response.status_code}: {http_response.text[:1000]}")
+                    return ""
+            except Exception as e:
+                logger.error(f"Fallback request failed with model {current_model}: {str(e)}")
+                return ""
+    return ""  # Return empty string if all attempts fail
 
-# Health check using OpenAI client
+# Health check endpoint
 @app.get("/health", response_model=HealthResponse)
 async def health_check():
     try:
-        models = client.models.list()
-        model_ids = [model.id for model in models.data]
+        base_url = "https://openrouter.ai/api/v1"
+        api_key = getenv("OPENROUTER_API_KEY")
+        env_base_url = getenv("OPENROUTER_BASE_URL")
+        if env_base_url and env_base_url != base_url:
+            logger.warning(f"Environment OPENROUTER_BASE_URL ({env_base_url}) overridden with {base_url}")
+        endpoint = f"{base_url.rstrip('/')}/models"
+        logger.debug(f"Health check requesting: {endpoint}")
+        headers = {"Authorization": f"Bearer {api_key}"}
+        response = requests.get(endpoint, headers=headers, timeout=5)
+        response.raise_for_status()
+        data = response.json()
+        model_ids = [model["id"] for model in data["data"]]
         return {"status": "healthy", "models": model_ids}
     except Exception as e:
         logger.error(f"Health check failed: {str(e)}")
         return {"status": "unhealthy", "error": str(e)}
 
-# Corrected clean_code function
+# Existing functions (unchanged)
 def clean_code(code: str, preserve_comments: bool = False) -> str:
     if not code:
         return ""
@@ -471,7 +640,7 @@ async def analyze_code_form(request: Request, code: str = Form(..., max_length=1
         health = await health_check()
         if health["status"] != "healthy":
             logger.error(f"OpenRouter API unavailable: {health.get('error', 'Unknown error')}")
-            return templates.TemplateResponse("index.html", {"request": request, "error": "OpenRouter API is unavailable"})
+            return templates.TemplateResponse("index.html", {"request": request, "error": f"OpenRouter API is unavailable: {health.get('error', 'Unknown error')}"})
         
         # Run Python-based analysis
         logger.debug(f"Processing code (first 100 chars): {code[:100]}...")
@@ -501,7 +670,9 @@ async def analyze_code_form(request: Request, code: str = Form(..., max_length=1
         ]
         generated = query_api(messages)
         if not generated:
-            return templates.TemplateResponse("index.html", {"request": request, "error": "Failed to generate code from API"})
+            error_msg = "Failed to generate code from API. Please check the API configuration or model availability."
+            logger.error(error_msg)
+            return templates.TemplateResponse("index.html", {"request": request, "error": error_msg})
         
         # Use generated code for both analyses
         is_similar, delta, delta_details = await analyze_code_with_generated(code, generated)
@@ -522,7 +693,7 @@ async def analyze_code_form(request: Request, code: str = Form(..., max_length=1
         })
     except Exception as e:
         logger.error(f"Analyze form endpoint failed: {str(e)}")
-        return templates.TemplateResponse("index.html", {"request": request, "error": str(e)})
+        return templates.TemplateResponse("index.html", {"request": request, "error": f"Analyze form failed: {str(e)}"})
 
 if __name__ == "__main__":
     import uvicorn
