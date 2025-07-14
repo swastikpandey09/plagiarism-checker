@@ -431,7 +431,7 @@ async def get_index(request: Request):
 async def analyze_code_form(request: Request, code: str = Form(..., max_length=100_000), handle: str = Form("triumph")):
     try:
         if not code.strip():
-            return templates.TemplateResponse("index.html", {"request": request, "error": "Code cannot besony_1">Code cannot be empty"})
+            return templates.TemplateResponse("index.html", {"request": request, "error": "Code cannot be empty"})
         
         # Validate handle
         SingleCodeInput(code=code, handle=handle)
