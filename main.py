@@ -15,7 +15,7 @@ import py7zr
 import tempfile
 import shutil
 from os import environ
-from openai import OpenAI
+from openai import OpenAI, APIError, RateLimitError, AuthenticationError
 from dotenv import load_dotenv
 from os import getenv
 
@@ -117,10 +117,10 @@ async def cleanup():
     except Exception as e:
         logger.error(f"Failed to clean up: {str(e)}")
 
-# Updated query_api function with specified model
+# Updated query_api function with enhanced error handling
 def query_api(messages: List[Dict[str, str]], model: str = "deepseek/deepseek-r1-0528", temp: float = 0.7, max_tokens: int = 2000) -> str:
     try:
-        logger.debug(f"Sending API request to OpenRouter with messages: {messages}")
+        logger.debug(f"Sending API request to OpenRouter with model {model} and messages: {messages}")
         response = client.chat.completions.create(
             model=model,
             messages=messages,
@@ -128,14 +128,23 @@ def query_api(messages: List[Dict[str, str]], model: str = "deepseek/deepseek-r1
             max_tokens=max_tokens
         )
         content = response.choices[0].message.content.strip()
-        logger.debug(f"API response: {content[:100]}...")
+        logger.debug(f"Raw API response: {content[:200]}...")  # Log first 200 chars of response
         match = re.search(r"```cpp\n(.*?)```", content, re.DOTALL)
         if not match:
-            logger.error("No valid C++ code found in API response")
+            logger.error(f"No valid C++ code block found in API response: {content[:500]}...")  # Log more for debugging
             return ""
         return match.group(1).strip()
+    except AuthenticationError as e:
+        logger.error(f"Authentication failed: Invalid OpenRouter API key - {str(e)}")
+        return ""
+    except RateLimitError as e:
+        logger.error(f"Rate limit exceeded for OpenRouter API - {str(e)}")
+        return ""
+    except APIError as e:
+        logger.error(f"OpenRouter API error: {str(e)}")
+        return ""
     except Exception as e:
-        logger.error(f"API query failed: {str(e)}")
+        logger.error(f"Unexpected error in API query: {str(e)}")
         return ""
 
 # Health check using OpenAI client
@@ -331,7 +340,18 @@ async def classify_code(code: str, handle: str) -> Tuple[bool, str, float, str]:
         return False, "Code cannot be empty", 0.0, handle
     cleaned = clean_code(code)
     messages = [
-        {"role": "system", "content": "Generate C++ code that matches the functionality of the given code. Ensure the code is complete and syntactically correct. Please wrap your response in a ```cpp code block."},
+        {
+            "role": "system",
+            "content": (
+                "You are an expert C++ programmer. Generate C++ code that replicates the functionality of the provided code. "
+                "Ensure the code is complete, syntactically correct, and uses modern C++ practices. "
+                "Wrap the generated code in a ```cpp code block, like this:\n"
+                "```cpp\n"
+                "// Your code here\n"
+                "```\n"
+                "Do not include explanations or comments outside the code block unless explicitly requested."
+            )
+        },
         {"role": "user", "content": code}
     ]
     try:
@@ -454,7 +474,18 @@ async def analyze_code_form(request: Request, code: str = Form(..., max_length=1
         
         # Call query_api once
         messages = [
-            {"role": "system", "content": "Generate C++ code that matches the functionality of the given code. Ensure the code is complete and syntactically correct. Please wrap your response in a ```cpp code block."},
+            {
+                "role": "system",
+                "content": (
+                    "You are an expert C++ programmer. Generate C++ code that replicates the functionality of the provided code. "
+                    "Ensure the code is complete, syntactically correct, and uses modern C++ practices. "
+                    "Wrap the generated code in a ```cpp code block, like this:\n"
+                    "```cpp\n"
+                    "// Your code here\n"
+                    "```\n"
+                    "Do not include explanations or comments outside the code block unless explicitly requested."
+                )
+            },
             {"role": "user", "content": code}
         ]
         generated = query_api(messages)
