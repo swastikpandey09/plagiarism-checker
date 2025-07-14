@@ -22,6 +22,14 @@ import requests
 import time
 import datetime
 
+# Logging setup (before any other imports)
+valid_log_levels = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
+log_level = environ.get("LOG_LEVEL", "DEBUG").upper()
+if log_level not in valid_log_levels:
+    log_level = "DEBUG"
+logging.basicConfig(level=getattr(logging, log_level), format="%(levelname)s | %(asctime)s | %(message)s")
+logger = logging.getLogger(__name__)
+
 # Load environment variables
 load_dotenv()
 
@@ -29,14 +37,13 @@ load_dotenv()
 env_base_url = getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
 correct_base_url = env_base_url if env_base_url.endswith("/v1") else "https://openrouter.ai/api/v1"
 if env_base_url != correct_base_url:
-    logging.warning(f"Environment OPENROUTER_BASE_URL ({env_base_url}) overridden with {correct_base_url}")
+    logger.warning(f"Environment OPENROUTER_BASE_URL ({env_base_url}) overridden with {correct_base_url}")
 api_key = getenv("OPENROUTER_API_KEY")
 if not api_key or not api_key.startswith("sk-or-v1-"):
-    logging.error("OPENROUTER_API_KEY is missing or invalid")
+    logger.error("OPENROUTER_API_KEY is missing or invalid")
     raise RuntimeError("OPENROUTER_API_KEY is missing or invalid")
 # Log masked API key for debugging
 masked_key = f"{api_key[:10]}...{api_key[-4:]}" if api_key else "None"
-logger = logging.getLogger(__name__)
 logger.info(f"Loaded OPENROUTER_API_KEY: {masked_key}")
 client = OpenAI(
     base_url=correct_base_url,
@@ -65,13 +72,6 @@ CONFIG = {
     "delta_threshold": 0.5,
     "plagiarism_threshold": 0.10,
 }
-
-# Logging setup
-valid_log_levels = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
-log_level = environ.get("LOG_LEVEL", "DEBUG").upper()
-if log_level not in valid_log_levels:
-    log_level = "DEBUG"
-logging.basicConfig(level=getattr(logging, log_level), format="%(levelname)s | %(asctime)s | %(message)s")
 
 # Verify MODEL_ARCHIVE exists (for reference, not loaded)
 if not MODEL_ARCHIVE.exists():
@@ -114,7 +114,7 @@ def check_openrouter_health(api_key: str, base_url: str = "https://openrouter.ai
             logger.error("Invalid or missing API key for health check")
             return False, []
         masked_key = f"{api_key[:10]}...{api_key[-4:]}" if api_key else "None"
-        logger.debug(f"Using API key: {masked_key} for health check")
+        logger.debug(f"Health check using API key: {masked_key}")
         env_base_url = getenv("OPENROUTER_BASE_URL")
         if env_base_url and env_base_url != base_url:
             logger.warning(f"Environment OPENROUTER_BASE_URL ({env_base_url}) overridden with {base_url}")
@@ -183,6 +183,7 @@ def query_api(messages: List[Dict[str, str]], model: str = None, temp: float = 0
         return ""
     masked_key = f"{api_key[:10]}...{api_key[-4:]}" if api_key else "None"
     logger.debug(f"Using API key: {masked_key} for query_api")
+    logger.debug(f"Authorization header: Bearer {masked_key}")
     
     # Use a default model from available models if not specified
     if not model:
@@ -236,6 +237,7 @@ def query_api(messages: List[Dict[str, str]], model: str = None, temp: float = 0
                     "Authorization": f"Bearer {api_key}",
                     "Content-Type": "application/json"
                 }
+                logger.debug(f"Fallback headers: {headers}")
                 payload = {
                     "model": current_model,
                     "messages": messages,
@@ -338,6 +340,7 @@ def query_api(messages: List[Dict[str, str]], model: str = None, temp: float = 0
                     "Authorization": f"Bearer {api_key}",
                     "Content-Type": "application/json"
                 }
+                logger.debug(f"Fallback headers: {headers}")
                 payload = {
                     "model": current_model,
                     "messages": messages,
