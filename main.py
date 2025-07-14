@@ -117,7 +117,7 @@ async def cleanup():
     except Exception as e:
         logger.error(f"Failed to clean up: {str(e)}")
 
-# Updated query_api function with new default model
+# Updated query_api function with specified model
 def query_api(messages: List[Dict[str, str]], model: str = "deepseek/deepseek-r1-0528", temp: float = 0.7, max_tokens: int = 2000) -> str:
     try:
         logger.debug(f"Sending API request to OpenRouter with messages: {messages}")
@@ -149,11 +149,11 @@ async def health_check():
         logger.error(f"Health check failed: {str(e)}")
         return {"status": "unhealthy", "error": str(e)}
 
-# Existing utility functions (unchanged)
+# Corrected clean_code function
 def clean_code(code: str, preserve_comments: bool = False) -> str:
     if not code:
         return ""
-    if not preserve_comments navin:
+    if not preserve_comments:
         code = re.sub(r'//.*', '', code)
         code = re.sub(r'/\*.*?\*/', '', code, flags=re.DOTALL)
     return re.sub(r'\s+', ' ', code).strip()
@@ -431,7 +431,7 @@ async def get_index(request: Request):
 async def analyze_code_form(request: Request, code: str = Form(..., max_length=100_000), handle: str = Form("triumph")):
     try:
         if not code.strip():
-            return templates.TemplateResponse("index.html", {"request": request, "error": "Code cannot be empty"})
+            return templates.TemplateResponse("index.html", {"request": request, "error": "Code cannot besony_1">Code cannot be empty"})
         
         # Validate handle
         SingleCodeInput(code=code, handle=handle)
