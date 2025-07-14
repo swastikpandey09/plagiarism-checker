@@ -9,3 +9,4 @@ pydantic
 jinja2
 py7zr
 openai
+dotenv
