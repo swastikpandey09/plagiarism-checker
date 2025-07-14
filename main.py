@@ -5,7 +5,6 @@ import hashlib
 import logging
 from pathlib import Path
 from typing import List, Tuple, Dict, Any, Optional
-import requests
 import numpy as np
 from fastapi import FastAPI, Form, Request
 from fastapi.responses import HTMLResponse
@@ -16,6 +15,18 @@ import py7zr
 import tempfile
 import shutil
 from os import environ
+from openai import OpenAI
+from dotenv import load_dotenv
+from os import getenv
+
+# Load environment variables
+load_dotenv()
+
+# Initialize OpenAI client with OpenRouter credentials
+client = OpenAI(
+    base_url=getenv("OPENROUTER_BASE_URL"),
+    api_key=getenv("OPENROUTER_API_KEY"),
+)
 
 # Initialize FastAPI app
 app = FastAPI(title="Code Plagiarism Detector", version="0.1.0")
@@ -48,9 +59,6 @@ if log_level not in valid_log_levels:
 logging.basicConfig(level=getattr(logging, log_level), format="%(levelname)s | %(asctime)s | %(message)s")
 logger = logging.getLogger(__name__)
 
-# LM Studio server URL (local or public tunnel)
-LM_STUDIO_URL = environ.get("LM_STUDIO_URL", "https://670sn0rg-1234.inc1.devtunnels.ms/v1")
-
 # Verify MODEL_ARCHIVE exists (for reference, not loaded)
 if not MODEL_ARCHIVE.exists():
     logger.warning("Model archive %s not found, skipping spaCy model loading", MODEL_ARCHIVE)
@@ -75,7 +83,7 @@ class SingleCodeInput(BaseModel):
 
 class HealthResponse(BaseModel):
     status: str
-    models: List[str]
+    models: List[str] = []
 
 class ValidationError(BaseModel):
     loc: List[str]
@@ -85,15 +93,15 @@ class ValidationError(BaseModel):
 class HTTPValidationError(BaseModel):
     detail: List[ValidationError]
 
+# Startup and shutdown events
 @app.on_event("startup")
 async def startup_event():
     try:
-        # Test LM Studio API health
-        response = requests.get(f"{LM_STUDIO_URL}/models", timeout=10)
-        response.raise_for_status()
-        logger.info("LM Studio API health check passed")
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Startup failed: LM Studio API unavailable - {str(e)}")
+        # Test OpenRouter API health
+        client.models.list()
+        logger.info("OpenRouter API health check passed")
+    except Exception as e:
+        logger.error(f"Startup failed: OpenRouter API unavailable - {str(e)}")
         raise RuntimeError(f"Startup failed: {str(e)}")
 
 @app.on_event("shutdown")
@@ -109,11 +117,43 @@ async def cleanup():
     except Exception as e:
         logger.error(f"Failed to clean up: {str(e)}")
 
-# Code processing utilities
+# Updated query_api function with new default model
+def query_api(messages: List[Dict[str, str]], model: str = "deepseek/deepseek-r1-0528", temp: float = 0.7, max_tokens: int = 2000) -> str:
+    try:
+        logger.debug(f"Sending API request to OpenRouter with messages: {messages}")
+        response = client.chat.completions.create(
+            model=model,
+            messages=messages,
+            temperature=temp,
+            max_tokens=max_tokens
+        )
+        content = response.choices[0].message.content.strip()
+        logger.debug(f"API response: {content[:100]}...")
+        match = re.search(r"```cpp\n(.*?)```", content, re.DOTALL)
+        if not match:
+            logger.error("No valid C++ code found in API response")
+            return ""
+        return match.group(1).strip()
+    except Exception as e:
+        logger.error(f"API query failed: {str(e)}")
+        return ""
+
+# Health check using OpenAI client
+@app.get("/health", response_model=HealthResponse)
+async def health_check():
+    try:
+        models = client.models.list()
+        model_ids = [model.id for model in models.data]
+        return {"status": "healthy", "models": model_ids}
+    except Exception as e:
+        logger.error(f"Health check failed: {str(e)}")
+        return {"status": "unhealthy", "error": str(e)}
+
+# Existing utility functions (unchanged)
 def clean_code(code: str, preserve_comments: bool = False) -> str:
     if not code:
         return ""
-    if not preserve_comments:
+    if not preserve_comments navin:
         code = re.sub(r'//.*', '', code)
         code = re.sub(r'/\*.*?\*/', '', code, flags=re.DOTALL)
     return re.sub(r'\s+', ' ', code).strip()
@@ -267,37 +307,6 @@ def compare_codes(code1: str, code2: str) -> Tuple[bool, str]:
     lcs_ratio = lcs_score / min(len(code1_clean), len(code2_clean)) if code1_clean and code2_clean else 0
     return lcs_ratio >= CONFIG["lcs_threshold"], f"LCS: {lcs_ratio:.2f}"
 
-def query_api(messages: List[Dict[str, str]], model: str = "gemma-3-12b-it", temp: float = 0.7, max_tokens: int = 2000) -> str:
-    try:
-        logger.debug(f"Sending API request to {LM_STUDIO_URL}/chat/completions with messages: {messages}")
-        payload = {
-            "model": model,
-            "messages": messages,
-            "temperature": temp,
-            "max_tokens": max_tokens
-        }
-        response = requests.post(
-            f"{LM_STUDIO_URL}/chat/completions",
-            json=payload,
-            headers={"Content-Type": "application/json"},
-            timeout=60
-        )
-        response.raise_for_status()
-        result = response.json()
-        content = result.get("choices", [{}])[0].get("message", {}).get("content", "")
-        logger.debug(f"API response: {content[:100]}...")
-        match = re.search(r"```cpp\n(.*?)```", content, re.DOTALL)
-        if not match:
-            logger.error("No valid C++ code found in API response")
-            return ""
-        return match.group(1).strip()
-    except requests.exceptions.HTTPError as e:
-        logger.error(f"API query failed with HTTP error: {str(e)} - Status: {e.response.status_code} - Details: {e.response.text}")
-        return ""
-    except requests.exceptions.RequestException as e:
-        logger.error(f"API query failed: {str(e)}")
-        return ""
-
 async def analyze_code_with_generated(code: str, generated: str) -> Tuple[bool, float, str]:
     if not code or not generated:
         return False, 0.0, "Empty code or generated code"
@@ -322,7 +331,7 @@ async def classify_code(code: str, handle: str) -> Tuple[bool, str, float, str]:
         return False, "Code cannot be empty", 0.0, handle
     cleaned = clean_code(code)
     messages = [
-        {"role": "system", "content": "Generate C++ code that matches the functionality of the given code. Ensure the code is complete and syntactically correct."},
+        {"role": "system", "content": "Generate C++ code that matches the functionality of the given code. Ensure the code is complete and syntactically correct. Please wrap your response in a ```cpp code block."},
         {"role": "user", "content": code}
     ]
     try:
@@ -430,8 +439,8 @@ async def analyze_code_form(request: Request, code: str = Form(..., max_length=1
         # Check API health
         health = await health_check()
         if health["status"] != "healthy":
-            logger.error(f"LM Studio API unavailable: {health.get('error', 'Unknown error')}")
-            return templates.TemplateResponse("index.html", {"request": request, "error": "LM Studio API is unavailable"})
+            logger.error(f"OpenRouter API unavailable: {health.get('error', 'Unknown error')}")
+            return templates.TemplateResponse("index.html", {"request": request, "error": "OpenRouter API is unavailable"})
         
         # Run Python-based analysis
         logger.debug(f"Processing code (first 100 chars): {code[:100]}...")
@@ -445,7 +454,7 @@ async def analyze_code_form(request: Request, code: str = Form(..., max_length=1
         
         # Call query_api once
         messages = [
-            {"role": "system", "content": "Generate C++ code that matches the functionality of the given code. Ensure the code is complete and syntactically correct."},
+            {"role": "system", "content": "Generate C++ code that matches the functionality of the given code. Ensure the code is complete and syntactically correct. Please wrap your response in a ```cpp code block."},
             {"role": "user", "content": code}
         ]
         generated = query_api(messages)
@@ -472,17 +481,6 @@ async def analyze_code_form(request: Request, code: str = Form(..., max_length=1
     except Exception as e:
         logger.error(f"Analyze form endpoint failed: {str(e)}")
         return templates.TemplateResponse("index.html", {"request": request, "error": str(e)})
-
-@app.get("/health", response_model=HealthResponse)
-async def health_check():
-    try:
-        response = requests.get(f"{LM_STUDIO_URL}/models", timeout=10)
-        response.raise_for_status()
-        models = response.json().get("data", [])
-        return {"status": "healthy", "models": [model["id"] for model in models]}
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Health check failed: {str(e)}")
-        return {"status": "unhealthy", "error": str(e)}
 
 if __name__ == "__main__":
     import uvicorn
