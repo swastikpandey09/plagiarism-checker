@@ -208,52 +208,9 @@ def query_api(messages: List[Dict[str, str]], model: str = None, temp: float = 0
                     logger.error(f"No valid C++ code block found in API response: {content[:1000]}")
                     return content.strip()  # Return raw content as last resort
                 return match.group(1).strip()
-        except APIError as e:
-            if ("404" in str(e) or "429" in str(e)) and current_model != fallback_model:
-                error_data = getattr(e, 'response', None)
-                delay = 60.0  # Default delay in seconds
-                if error_data and "429" in str(e):
-                    try:
-                        error_json = error_data.json()
-                        reset_time = int(error_json.get('error', {}).get('metadata', {}).get('headers', {}).get('X-RateLimit-Reset', 0))
-                        if reset_time:
-                            current_time = int(time.time() * 1000) / 1000  # Current time in seconds
-                            delay = max((reset_time / 1000) - current_time, 0) + 1  # Add 1 second buffer
-                        logger.warning(f"Rate limit headers: Limit={error_json.get('error', {}).get('metadata', {}).get('headers', {}).get('X-RateLimit-Limit', 'N/A')}, "
-                                      f"Remaining={error_json.get('error', {}).get('metadata', {}).get('headers', {}).get('X-RateLimit-Remaining', 'N/A')}, "
-                                      f"Reset={error_json.get('error', {}).get('metadata', {}).get('headers', {}).get('X-RateLimit-Reset', 'N/A')}")
-                    except (ValueError, AttributeError) as parse_err:
-                        logger.error(f"Failed to parse rate limit headers: {str(parse_err)}")
-                logger.warning(f"API error with model {current_model}: {str(e)}. Waiting {delay:.2f}s before retrying with fallback model {fallback_model}")
-                time.sleep(delay)
-                continue  # Try the fallback model
-            logger.error(f"OpenRouter API error with model {current_model}: {str(e)}")
-            return ""
         except AuthenticationError as e:
-            logger.error(f"Authentication failed: Invalid OpenRouter API key - {str(e)}")
-            return ""
-        except RateLimitError as e:
-            if current_model != fallback_model:
-                delay = 60.0  # Default delay
-                try:
-                    error_json = e.response.json()
-                    reset_time = int(error_json.get('error', {}).get('metadata', {}).get('headers', {}).get('X-RateLimit-Reset', 0))
-                    if reset_time:
-                        current_time = int(time.time() * 1000) / 1000
-                        delay = max((reset_time / 1000) - current_time, 0) + 1
-                    logger.warning(f"Rate limit headers: Limit={error_json.get('error', {}).get('metadata', {}).get('headers', {}).get('X-RateLimit-Limit', 'N/A')}, "
-                                  f"Remaining={error_json.get('error', {}).get('metadata', {}).get('headers', {}).get('X-RateLimit-Remaining', 'N/A')}, "
-                                  f"Reset={error_json.get('error', {}).get('metadata', {}).get('headers', {}).get('X-RateLimit-Reset', 'N/A')}")
-                except (ValueError, AttributeError) as parse_err:
-                    logger.error(f"Failed to parse rate limit headers: {str(parse_err)}")
-                logger.warning(f"Rate limit exceeded for model {current_model}: {str(e)}. Waiting {delay:.2f}s before retrying with fallback model {fallback_model}")
-                time.sleep(delay)
-                continue
-            logger.error(f"Rate limit exceeded for OpenRouter API with model {current_model}: {str(e)}")
-            return ""
-        except Exception as e:
-            logger.error(f"Unexpected error in API query with model {current_model}: {str(e)}")
-            # Fallback to direct HTTP request
+            logger.error(f"Authentication failed with model {current_model}: Invalid OpenRouter API key - {str(e)}")
+            # Attempt direct HTTP request as fallback
             try:
                 headers = {
                     "Authorization": f"Bearer {getenv('OPENROUTER_API_KEY')}",
@@ -284,31 +241,133 @@ def query_api(messages: List[Dict[str, str]], model: str = None, temp: float = 0
                                 if match:
                                     return match.group(1).strip()
                                 logger.error(f"No valid C++ code block in fallback response: {content[:1000]}")
-                                return content.strip()  # Return raw content as last resort
+                                return content.strip()
                             return code.strip()
                         except json.JSONDecodeError:
                             logger.error(f"Failed to parse fallback JSON response: {content[:1000]}")
                             match = re.search(r"```cpp\n(.*?)```", content, re.DOTALL)
                             if not match:
                                 logger.error(f"No valid C++ code block in fallback response: {content[:1000]}")
-                                return content.strip()  # Return raw content as last resort
+                                return content.strip()
                             return match.group(1).strip()
                     except Exception as e:
                         logger.error(f"Failed to parse fallback response: {str(e)}")
                         return ""
+                elif http_response.status_code == 401 and current_model != fallback_model:
+                    logger.warning(f"Fallback HTTP 401 with model {current_model}: {http_response.text[:1000]}. Retrying with fallback model {fallback_model}")
+                    continue
                 elif (http_response.status_code == 404 or http_response.status_code == 429) and current_model != fallback_model:
-                    delay = 60.0
+                    delay = 60.0  # Fixed 60-second delay
                     if http_response.status_code == 429:
-                        reset_time = int(http_response.headers.get('X-RateLimit-Reset', 0))
-                        if reset_time:
-                            current_time = int(time.time() * 1000) / 1000
-                            delay = max((reset_time / 1000) - current_time, 0) + 1
                         logger.warning(f"Fallback rate limit headers: Limit={http_response.headers.get('X-RateLimit-Limit', 'N/A')}, "
                                       f"Remaining={http_response.headers.get('X-RateLimit-Remaining', 'N/A')}, "
                                       f"Reset={http_response.headers.get('X-RateLimit-Reset', 'N/A')}")
-                    logger.warning(f"Fallback HTTP {http_response.status_code} with model {current_model}: {http_response.text[:1000]}. Waiting {delay:.2f}s before retrying with fallback model {fallback_model}")
+                        logger.warning(f"Fallback rate limit exceeded with model {current_model}: {http_response.text[:1000]}. Waiting exactly {delay:.2f}s before retrying with fallback model {fallback_model}")
+                    else:
+                        logger.warning(f"Fallback HTTP {http_response.status_code} with model {current_model}: {http_response.text[:1000]}. Waiting {delay:.2f}s before retrying with fallback model {fallback_model}")
                     time.sleep(delay)
-                    continue  # Try the fallback model
+                    continue
+                else:
+                    logger.error(f"Fallback HTTP request failed with status {http_response.status_code}: {http_response.text[:1000]}")
+                    return ""
+            except Exception as e:
+                logger.error(f"Fallback request failed with model {current_model}: {str(e)}")
+                return ""
+        except APIError as e:
+            if ("401" in str(e) or "404" in str(e) or "429" in str(e)) and current_model != fallback_model:
+                delay = 60.0  # Fixed 60-second delay for 429 or 404, no delay for 401
+                if "401" in str(e):
+                    logger.warning(f"Authentication error with model {current_model}: {str(e)}. Retrying with fallback model {fallback_model}")
+                elif "429" in str(e):
+                    try:
+                        error_json = e.response.json()
+                        logger.warning(f"Rate limit headers: Limit={error_json.get('error', {}).get('metadata', {}).get('headers', {}).get('X-RateLimit-Limit', 'N/A')}, "
+                                      f"Remaining={error_json.get('error', {}).get('metadata', {}).get('headers', {}).get('X-RateLimit-Remaining', 'N/A')}, "
+                                      f"Reset={error_json.get('error', {}).get('metadata', {}).get('headers', {}).get('X-RateLimit-Reset', 'N/A')}")
+                    except (ValueError, AttributeError) as parse_err:
+                        logger.error(f"Failed to parse rate limit headers: {str(parse_err)}")
+                    logger.warning(f"Rate limit exceeded for model {current_model}: {str(e)}. Waiting exactly {delay:.2f}s before retrying with fallback model {fallback_model}")
+                    time.sleep(delay)
+                else:
+                    logger.warning(f"API error with model {current_model}: {str(e)}. Waiting {delay:.2f}s before retrying with fallback model {fallback_model}")
+                    time.sleep(delay)
+                continue
+            logger.error(f"OpenRouter API error with model {current_model}: {str(e)}")
+            return ""
+        except RateLimitError as e:
+            if current_model != fallback_model:
+                delay = 60.0  # Fixed 60-second delay
+                try:
+                    error_json = e.response.json()
+                    logger.warning(f"Rate limit headers: Limit={error_json.get('error', {}).get('metadata', {}).get('headers', {}).get('X-RateLimit-Limit', 'N/A')}, "
+                                  f"Remaining={error_json.get('error', {}).get('metadata', {}).get('headers', {}).get('X-RateLimit-Remaining', 'N/A')}, "
+                                  f"Reset={error_json.get('error', {}).get('metadata', {}).get('headers', {}).get('X-RateLimit-Reset', 'N/A')}")
+                except (ValueError, AttributeError) as parse_err:
+                    logger.error(f"Failed to parse rate limit headers: {str(parse_err)}")
+                logger.warning(f"Rate limit exceeded for model {current_model}: {str(e)}. Waiting exactly {delay:.2f}s before retrying with fallback model {fallback_model}")
+                time.sleep(delay)
+                continue
+            logger.error(f"Rate limit exceeded for OpenRouter API with model {current_model}: {str(e)}")
+            return ""
+        except Exception as e:
+            logger.error(f"Unexpected error in API query with model {current_model}: {str(e)}")
+            # Attempt direct HTTP request as fallback
+            try:
+                headers = {
+                    "Authorization": f"Bearer {getenv('OPENROUTER_API_KEY')}",
+                    "Content-Type": "application/json"
+                }
+                payload = {
+                    "model": current_model,
+                    "messages": messages,
+                    "temperature": temp,
+                    "max_tokens": max_tokens,
+                    "response_format": {"type": "json_object"}
+                }
+                http_response = requests.post(request_url, headers=headers, json=payload, timeout=10)
+                logger.debug(f"Fallback HTTP status: {http_response.status_code}")
+                logger.debug(f"Fallback HTTP headers: {http_response.headers}")
+                logger.debug(f"Fallback HTTP response: {http_response.text[:1000]}...")
+                if http_response.status_code == 200:
+                    try:
+                        data = http_response.json()
+                        content = data['choices'][0]['message']['content'].strip()
+                        logger.debug(f"Fallback raw response: {content[:1000]}...")
+                        try:
+                            parsed = json.loads(content)
+                            code = parsed.get("code", "")
+                            if not code:
+                                logger.error(f"No 'code' field in fallback JSON response: {content[:1000]}")
+                                match = re.search(r"```cpp\n(.*?)```", content, re.DOTALL)
+                                if match:
+                                    return match.group(1).strip()
+                                logger.error(f"No valid C++ code block in fallback response: {content[:1000]}")
+                                return content.strip()
+                            return code.strip()
+                        except json.JSONDecodeError:
+                            logger.error(f"Failed to parse fallback JSON response: {content[:1000]}")
+                            match = re.search(r"```cpp\n(.*?)```", content, re.DOTALL)
+                            if not match:
+                                logger.error(f"No valid C++ code block in fallback response: {content[:1000]}")
+                                return content.strip()
+                            return match.group(1).strip()
+                    except Exception as e:
+                        logger.error(f"Failed to parse fallback response: {str(e)}")
+                        return ""
+                elif http_response.status_code == 401 and current_model != fallback_model:
+                    logger.warning(f"Fallback HTTP 401 with model {current_model}: {http_response.text[:1000]}. Retrying with fallback model {fallback_model}")
+                    continue
+                elif (http_response.status_code == 404 or http_response.status_code == 429) and current_model != fallback_model:
+                    delay = 60.0  # Fixed 60-second delay
+                    if http_response.status_code == 429:
+                        logger.warning(f"Fallback rate limit headers: Limit={http_response.headers.get('X-RateLimit-Limit', 'N/A')}, "
+                                      f"Remaining={http_response.headers.get('X-RateLimit-Remaining', 'N/A')}, "
+                                      f"Reset={http_response.headers.get('X-RateLimit-Reset', 'N/A')}")
+                        logger.warning(f"Fallback rate limit exceeded with model {current_model}: {http_response.text[:1000]}. Waiting exactly {delay:.2f}s before retrying with fallback model {fallback_model}")
+                    else:
+                        logger.warning(f"Fallback HTTP {http_response.status_code} with model {current_model}: {http_response.text[:1000]}. Waiting {delay:.2f}s before retrying with fallback model {fallback_model}")
+                    time.sleep(delay)
+                    continue
                 else:
                     logger.error(f"Fallback HTTP request failed with status {http_response.status_code}: {http_response.text[:1000]}")
                     return ""
