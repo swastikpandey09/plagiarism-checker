@@ -30,9 +30,13 @@ env_base_url = getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
 correct_base_url = env_base_url if env_base_url.endswith("/v1") else "https://openrouter.ai/api/v1"
 if env_base_url != correct_base_url:
     logging.warning(f"Environment OPENROUTER_BASE_URL ({env_base_url}) overridden with {correct_base_url}")
+api_key = getenv("OPENROUTER_API_KEY")
+if not api_key or not api_key.startswith("sk-or-v1-"):
+    logging.error("OPENROUTER_API_KEY is missing or invalid")
+    raise RuntimeError("OPENROUTER_API_KEY is missing or invalid")
 client = OpenAI(
     base_url=correct_base_url,
-    api_key=getenv("OPENROUTER_API_KEY"),
+    api_key=api_key,
 )
 
 # Initialize FastAPI app
@@ -103,6 +107,9 @@ class HTTPValidationError(BaseModel):
 # Helper function to check OpenRouter API health and get available models
 def check_openrouter_health(api_key: str, base_url: str = "https://openrouter.ai/api/v1") -> Tuple[bool, List[str]]:
     try:
+        if not api_key or not api_key.startswith("sk-or-v1-"):
+            logger.error("Invalid or missing API key for health check")
+            return False, []
         env_base_url = getenv("OPENROUTER_BASE_URL")
         if env_base_url and env_base_url != base_url:
             logger.warning(f"Environment OPENROUTER_BASE_URL ({env_base_url}) overridden with {base_url}")
@@ -137,9 +144,9 @@ async def startup_event():
     base_url = "https://openrouter.ai/api/v1"
     env_base_url = getenv("OPENROUTER_BASE_URL")
     logger.debug(f"Environment OPENROUTER_BASE_URL: {env_base_url}, using: {base_url}")
-    if not api_key:
-        logger.error("OPENROUTER_API_KEY environment variable is not set")
-        raise RuntimeError("OPENROUTER_API_KEY environment variable is not set")
+    if not api_key or not api_key.startswith("sk-or-v1-"):
+        logger.error("OPENROUTER_API_KEY is missing or invalid")
+        raise RuntimeError("OPENROUTER_API_KEY is missing or invalid")
     # Test OpenRouter API health
     is_healthy, models = check_openrouter_health(api_key, base_url)
     if not is_healthy:
@@ -164,14 +171,20 @@ async def cleanup():
 
 # Query API function with enhanced error handling and fallback
 def query_api(messages: List[Dict[str, str]], model: str = None, temp: float = 0.7, max_tokens: int = 2000) -> str:
+    # Validate API key
+    api_key = getenv("OPENROUTER_API_KEY")
+    if not api_key or not api_key.startswith("sk-or-v1-"):
+        logger.error("OPENROUTER_API_KEY is missing or invalid in query_api")
+        return ""
+    
     # Use a default model from available models if not specified
     if not model:
         available_models = getattr(app.state, "available_models", [])
         model = next((m for m in available_models if m == "deepseek/deepseek-r1-0528:free"), "deepseek/deepseek-r1-0528:free")
         logger.debug(f"No model specified, using: {model}")
     
-    fallback_model = "qwen/qwen3-8b:free"  # Fallback model if primary fails
-    models_to_try = [model, fallback_model]
+    fallback_models = ["qwen/qwen3-8b:free", "mistralai/mistral-7b-instruct:free"]  # Multiple fallback models
+    models_to_try = [model] + fallback_models
     
     for current_model in models_to_try:
         try:
@@ -213,7 +226,7 @@ def query_api(messages: List[Dict[str, str]], model: str = None, temp: float = 0
             # Attempt direct HTTP request as fallback
             try:
                 headers = {
-                    "Authorization": f"Bearer {getenv('OPENROUTER_API_KEY')}",
+                    "Authorization": f"Bearer {api_key}",
                     "Content-Type": "application/json"
                 }
                 payload = {
@@ -223,6 +236,7 @@ def query_api(messages: List[Dict[str, str]], model: str = None, temp: float = 0
                     "max_tokens": max_tokens,
                     "response_format": {"type": "json_object"}
                 }
+                logger.debug(f"Sending fallback HTTP request for model {current_model}")
                 http_response = requests.post(request_url, headers=headers, json=payload, timeout=10)
                 logger.debug(f"Fallback HTTP status: {http_response.status_code}")
                 logger.debug(f"Fallback HTTP headers: {http_response.headers}")
@@ -253,31 +267,31 @@ def query_api(messages: List[Dict[str, str]], model: str = None, temp: float = 0
                     except Exception as e:
                         logger.error(f"Failed to parse fallback response: {str(e)}")
                         return ""
-                elif http_response.status_code == 401 and current_model != fallback_model:
-                    logger.warning(f"Fallback HTTP 401 with model {current_model}: {http_response.text[:1000]}. Retrying with fallback model {fallback_model}")
+                elif http_response.status_code == 401 and current_model != models_to_try[-1]:
+                    logger.warning(f"Fallback HTTP 401 with model {current_model}: {http_response.text[:1000]}. Retrying with next model")
                     continue
-                elif (http_response.status_code == 404 or http_response.status_code == 429) and current_model != fallback_model:
+                elif (http_response.status_code == 404 or http_response.status_code == 429) and current_model != models_to_try[-1]:
                     delay = 60.0  # Fixed 60-second delay
                     if http_response.status_code == 429:
                         logger.warning(f"Fallback rate limit headers: Limit={http_response.headers.get('X-RateLimit-Limit', 'N/A')}, "
                                       f"Remaining={http_response.headers.get('X-RateLimit-Remaining', 'N/A')}, "
                                       f"Reset={http_response.headers.get('X-RateLimit-Reset', 'N/A')}")
-                        logger.warning(f"Fallback rate limit exceeded with model {current_model}: {http_response.text[:1000]}. Waiting exactly {delay:.2f}s before retrying with fallback model {fallback_model}")
+                        logger.warning(f"Fallback rate limit exceeded with model {current_model}: {http_response.text[:1000]}. Waiting exactly {delay:.2f}s before retrying with next model")
                     else:
-                        logger.warning(f"Fallback HTTP {http_response.status_code} with model {current_model}: {http_response.text[:1000]}. Waiting {delay:.2f}s before retrying with fallback model {fallback_model}")
+                        logger.warning(f"Fallback HTTP {http_response.status_code} with model {current_model}: {http_response.text[:1000]}. Waiting {delay:.2f}s before retrying with next model")
                     time.sleep(delay)
                     continue
                 else:
                     logger.error(f"Fallback HTTP request failed with status {http_response.status_code}: {http_response.text[:1000]}")
                     return ""
             except Exception as e:
-                logger.error(f"Fallback request failed with model {current_model}: {str(e)}")
+                logger.error(f"Fallback HTTP request failed with model {current_model}: {str(e)}")
                 return ""
         except APIError as e:
-            if ("401" in str(e) or "404" in str(e) or "429" in str(e)) and current_model != fallback_model:
+            if ("401" in str(e) or "404" in str(e) or "429" in str(e)) and current_model != models_to_try[-1]:
                 delay = 60.0  # Fixed 60-second delay for 429 or 404, no delay for 401
                 if "401" in str(e):
-                    logger.warning(f"Authentication error with model {current_model}: {str(e)}. Retrying with fallback model {fallback_model}")
+                    logger.warning(f"Authentication error with model {current_model}: {str(e)}. Retrying with next model")
                 elif "429" in str(e):
                     try:
                         error_json = e.response.json()
@@ -286,16 +300,16 @@ def query_api(messages: List[Dict[str, str]], model: str = None, temp: float = 0
                                       f"Reset={error_json.get('error', {}).get('metadata', {}).get('headers', {}).get('X-RateLimit-Reset', 'N/A')}")
                     except (ValueError, AttributeError) as parse_err:
                         logger.error(f"Failed to parse rate limit headers: {str(parse_err)}")
-                    logger.warning(f"Rate limit exceeded for model {current_model}: {str(e)}. Waiting exactly {delay:.2f}s before retrying with fallback model {fallback_model}")
+                    logger.warning(f"Rate limit exceeded for model {current_model}: {str(e)}. Waiting exactly {delay:.2f}s before retrying with next model")
                     time.sleep(delay)
                 else:
-                    logger.warning(f"API error with model {current_model}: {str(e)}. Waiting {delay:.2f}s before retrying with fallback model {fallback_model}")
+                    logger.warning(f"API error with model {current_model}: {str(e)}. Waiting {delay:.2f}s before retrying with next model")
                     time.sleep(delay)
                 continue
             logger.error(f"OpenRouter API error with model {current_model}: {str(e)}")
             return ""
         except RateLimitError as e:
-            if current_model != fallback_model:
+            if current_model != models_to_try[-1]:
                 delay = 60.0  # Fixed 60-second delay
                 try:
                     error_json = e.response.json()
@@ -304,7 +318,7 @@ def query_api(messages: List[Dict[str, str]], model: str = None, temp: float = 0
                                   f"Reset={error_json.get('error', {}).get('metadata', {}).get('headers', {}).get('X-RateLimit-Reset', 'N/A')}")
                 except (ValueError, AttributeError) as parse_err:
                     logger.error(f"Failed to parse rate limit headers: {str(parse_err)}")
-                logger.warning(f"Rate limit exceeded for model {current_model}: {str(e)}. Waiting exactly {delay:.2f}s before retrying with fallback model {fallback_model}")
+                logger.warning(f"Rate limit exceeded for model {current_model}: {str(e)}. Waiting exactly {delay:.2f}s before retrying with next model")
                 time.sleep(delay)
                 continue
             logger.error(f"Rate limit exceeded for OpenRouter API with model {current_model}: {str(e)}")
@@ -314,7 +328,7 @@ def query_api(messages: List[Dict[str, str]], model: str = None, temp: float = 0
             # Attempt direct HTTP request as fallback
             try:
                 headers = {
-                    "Authorization": f"Bearer {getenv('OPENROUTER_API_KEY')}",
+                    "Authorization": f"Bearer {api_key}",
                     "Content-Type": "application/json"
                 }
                 payload = {
@@ -324,6 +338,7 @@ def query_api(messages: List[Dict[str, str]], model: str = None, temp: float = 0
                     "max_tokens": max_tokens,
                     "response_format": {"type": "json_object"}
                 }
+                logger.debug(f"Sending fallback HTTP request for model {current_model}")
                 http_response = requests.post(request_url, headers=headers, json=payload, timeout=10)
                 logger.debug(f"Fallback HTTP status: {http_response.status_code}")
                 logger.debug(f"Fallback HTTP headers: {http_response.headers}")
@@ -354,26 +369,27 @@ def query_api(messages: List[Dict[str, str]], model: str = None, temp: float = 0
                     except Exception as e:
                         logger.error(f"Failed to parse fallback response: {str(e)}")
                         return ""
-                elif http_response.status_code == 401 and current_model != fallback_model:
-                    logger.warning(f"Fallback HTTP 401 with model {current_model}: {http_response.text[:1000]}. Retrying with fallback model {fallback_model}")
+                elif http_response.status_code == 401 and current_model != models_to_try[-1]:
+                    logger.warning(f"Fallback HTTP 401 with model {current_model}: {http_response.text[:1000]}. Retrying with next model")
                     continue
-                elif (http_response.status_code == 404 or http_response.status_code == 429) and current_model != fallback_model:
+                elif (http_response.status_code == 404 or http_response.status_code == 429) and current_model != models_to_try[-1]:
                     delay = 60.0  # Fixed 60-second delay
                     if http_response.status_code == 429:
                         logger.warning(f"Fallback rate limit headers: Limit={http_response.headers.get('X-RateLimit-Limit', 'N/A')}, "
                                       f"Remaining={http_response.headers.get('X-RateLimit-Remaining', 'N/A')}, "
                                       f"Reset={http_response.headers.get('X-RateLimit-Reset', 'N/A')}")
-                        logger.warning(f"Fallback rate limit exceeded with model {current_model}: {http_response.text[:1000]}. Waiting exactly {delay:.2f}s before retrying with fallback model {fallback_model}")
+                        logger.warning(f"Fallback rate limit exceeded with model {current_model}: {http_response.text[:1000]}. Waiting exactly {delay:.2f}s before retrying with next model")
                     else:
-                        logger.warning(f"Fallback HTTP {http_response.status_code} with model {current_model}: {http_response.text[:1000]}. Waiting {delay:.2f}s before retrying with fallback model {fallback_model}")
+                        logger.warning(f"Fallback HTTP {http_response.status_code} with model {current_model}: {http_response.text[:1000]}. Waiting {delay:.2f}s before retrying with next model")
                     time.sleep(delay)
                     continue
                 else:
                     logger.error(f"Fallback HTTP request failed with status {http_response.status_code}: {http_response.text[:1000]}")
                     return ""
             except Exception as e:
-                logger.error(f"Fallback request failed with model {current_model}: {str(e)}")
+                logger.error(f"Fallback HTTP request failed with model {current_model}: {str(e)}")
                 return ""
+    logger.error(f"All models failed: {models_to_try}")
     return ""  # Return empty string if all attempts fail
 
 # Health check endpoint
@@ -382,6 +398,9 @@ async def health_check():
     try:
         base_url = "https://openrouter.ai/api/v1"
         api_key = getenv("OPENROUTER_API_KEY")
+        if not api_key or not api_key.startswith("sk-or-v1-"):
+            logger.error("OPENROUTER_API_KEY is missing or invalid in health check")
+            return {"status": "unhealthy", "error": "Invalid or missing API key"}
         env_base_url = getenv("OPENROUTER_BASE_URL")
         if env_base_url and env_base_url != base_url:
             logger.warning(f"Environment OPENROUTER_BASE_URL ({env_base_url}) overridden with {base_url}")
