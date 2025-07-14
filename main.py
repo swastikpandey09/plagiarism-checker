@@ -96,13 +96,24 @@ class HTTPValidationError(BaseModel):
 # Startup and shutdown events
 @app.on_event("startup")
 async def startup_event():
+    # Validate environment variables
+    if not getenv("OPENROUTER_API_KEY"):
+        logger.error("OPENROUTER_API_KEY environment variable is not set")
+        raise RuntimeError("OPENROUTER_API_KEY environment variable is not set")
+    if not getenv("OPENROUTER_BASE_URL"):
+        logger.error("OPENROUTER_BASE_URL environment variable is not set")
+        raise RuntimeError("OPENROUTER_BASE_URL environment variable is not set")
+    
     try:
         # Test OpenRouter API health
         client.models.list()
         logger.info("OpenRouter API health check passed")
+    except AuthenticationError as e:
+        logger.error(f"Startup failed: Invalid OpenRouter API key - {str(e)}")
+        raise RuntimeError(f"Startup failed: Invalid OpenRouter API key - {str(e)}")
     except Exception as e:
         logger.error(f"Startup failed: OpenRouter API unavailable - {str(e)}")
-        raise RuntimeError(f"Startup failed: {str(e)}")
+        raise RuntimeError(f"Startup failed: OpenRouter API unavailable - {str(e)}")
 
 @app.on_event("shutdown")
 async def cleanup():
@@ -131,7 +142,7 @@ def query_api(messages: List[Dict[str, str]], model: str = "deepseek/deepseek-r1
         logger.debug(f"Raw API response: {content[:200]}...")  # Log first 200 chars of response
         match = re.search(r"```cpp\n(.*?)```", content, re.DOTALL)
         if not match:
-            logger.error(f"No valid C++ code block found in API response: {content[:500]}...")  # Log more for debugging
+            logger.error(f"No valid C++ code block found in API response: {content[:500]}...")
             return ""
         return match.group(1).strip()
     except AuthenticationError as e:
