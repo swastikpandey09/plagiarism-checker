@@ -9,7 +9,7 @@
     
     <!-- Single Code Submission Form -->
     <h2>Analyze Code</h2>
-    <form method="post" action="/a">
+    <form method="post" action="/analyze">
         <label for="handle">Handle:</label><br>
         <input type="text" id="handle" name="handle" value="triumph"><br>
         <label for="code">Code:</label><br>
@@ -23,10 +23,17 @@
         <p>{{ error }}</p>
     {% endif %}
     
-    <!-- Display Single Result -->
+    <!-- Display Message -->
+    {% if message %}
+        <h3>Message</h3>
+        <p>{{ message }}</p>
+    {% endif %}
+    
+    <!-- Display Single Analysis Result -->
     {% if result %}
         <h3>Result for {{ result.handle }}</h3>
         <pre>{{ result.report }}</pre>
+        <p>Label: {{ result.label }} (Confidence: {{ "%.2f" | format(result.confidence * 100) }}%)</p>
     {% endif %}
     
 </body>
