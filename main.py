@@ -188,7 +188,7 @@ def query_api(messages: List[Dict[str, str]], model: str = None, temp: float = 0
     # Use a default model from available models if not specified
     if not model:
         available_models = getattr(app.state, "available_models", [])
-        model = next((m for m in available_models if m == "deepseek/deepseek-r1-0528:free"), "deepseek/deepseek-r1-0528:free")
+        model = next((m for m in available_models if m == "moonshotai/kimi-k2:free"), "moonshotai/kimi-k2:free")
         logger.debug(f"No model specified, using: {model}")
     
     fallback_models = ["qwen/qwen3-8b:free", "mistralai/mistral-7b-instruct:free"]
