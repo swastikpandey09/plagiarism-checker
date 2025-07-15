@@ -614,12 +614,12 @@ async def classify_code(code: str, handle: str) -> Tuple[bool, str, float, str]:
             "role": "system",
             "content": (
                 "You are an expert C++ programmer. Generate C++ code that replicates the functionality of the provided code. "
-                "Ensure the code is complete, syntactically correct, and uses modern C++ practices. "
+                "Ensure the code is complete, syntactically correct, and uses modern C++ practices. you just get the input code and get its intent, then you write a new whole code to do same thing but in your way"
                 "Wrap the generated code in a ```cpp code block, like this:\n"
                 "```cpp\n"
                 "// Your code here\n"
                 "```\n"
-                "Do not include explanations or comments outside the code block unless explicitly requested."
+                "Do not include explanations or comments outside the code block unless explicitly requested or are already in input code."
             )
         },
         {"role": "user", "content": code}
