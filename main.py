@@ -340,7 +340,7 @@ def classify_code(code: str, handle: str) -> Tuple[bool, str, float, str]:
             deviation += diff
             deviation_details.append(f"Unknown token '{token}': freq {actual_freq:.2f}, penalty {penalty}, diff {diff:.2f}")
     deviation = math.sqrt(deviation / max(matched_tokens, 1))
-    threshold = 30.0
+    threshold = 50.0
     confidence = min(0.99, 1.0 / (1.0 + math.exp(-0.05 * (threshold - deviation))))
     label = "Human" if deviation < threshold else "AI"
     return True, label, confidence, handle
