@@ -14,19 +14,20 @@ from pydantic import BaseModel, validator
 import py7zr
 import tempfile
 import shutil
-from os import environ
+from os import environ, getenv
 from openai import OpenAI, APIError, RateLimitError, AuthenticationError
 from dotenv import load_dotenv
-from os import getenv
 import requests
 import time
 import datetime
+from collections import Counter
+import math
 
-# Logging setup (before any other imports)
+# Logging setup
 valid_log_levels = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
-log_level = environ.get("LOG_LEVEL", "DEBUG").upper()
+log_level = environ.get("LOG_LEVEL", "INFO").upper()
 if log_level not in valid_log_levels:
-    log_level = "DEBUG"
+    log_level = "INFO"
 logging.basicConfig(level=getattr(logging, log_level), format="%(levelname)s | %(asctime)s | %(message)s")
 logger = logging.getLogger(__name__)
 
@@ -42,13 +43,9 @@ api_key = getenv("OPENROUTER_API_KEY")
 if not api_key or not api_key.startswith("sk-or-v1-"):
     logger.error("OPENROUTER_API_KEY is missing or invalid")
     raise RuntimeError("OPENROUTER_API_KEY is missing or invalid")
-# Log masked API key for debugging
 masked_key = f"{api_key[:10]}...{api_key[-4:]}" if api_key else "None"
 logger.info(f"Loaded OPENROUTER_API_KEY: {masked_key}")
-client = OpenAI(
-    base_url=correct_base_url,
-    api_key=api_key,
-)
+client = OpenAI(base_url=correct_base_url, api_key=api_key)
 
 # Initialize FastAPI app
 app = FastAPI(title="Code Plagiarism Detector", version="0.1.0")
@@ -69,11 +66,26 @@ CONFIG = {
     "var_length": 5,
     "comment_length": 5,
     "comment_block": 5,
-    "delta_threshold": 0.5,
+    "delta_threshold": 0.10,
     "plagiarism_threshold": 0.10,
 }
 
-# Verify MODEL_ARCHIVE exists (for reference, not loaded)
+# Token frequencies from Codeforces
+HUMAN_FREQUENCIES = {
+    'i': 43.15, 'n': 34.04, 't': 32.95, 'e': 28.78, 's': 23.73, ';': 22.71, '(': 21.37, ')': 21.36,
+    'r': 19.57, '=': 18.26, 'a': 18.10, 'o': 17.22, 'c': 14.98, 'l': 14.78, ',': 13.93, '1': 13.16,
+    'p': 12.35, 'u': 12.31, 'd': 11.24, 'f': 10.57, 'int': 7.22, '0': 5.64, 'if': 3.72,
+    'x': 3.07, 'for': 2.93, 'j': 2.80, 'k': 2.67, 'b': 2.12, 'v': 1.89, 'cin': 1.81,
+    '2': 1.78, 'm': 1.70, 'y': 1.59, 'return': 1.35, 'using': 1.32, 'else': 1.27, 'cout': 1.22,
+    'll': 1.13, '#include': 1.01, '<iostream>': 1.01, '<cmath>': 0.8, '<set>': 0.8, '<vector>': 0.8,
+    '<map>': 0.8, '<string>': 0.8, '<algorithm>': 0.8, 'namespace': 1.0, 'std': 1.0, 'char': 1.5,
+    'while': 1.5, '>>': 1.2, '<<': 1.2, 'endl': 1.0, 'main': 1.0, 'num': 1.0, 'let': 0.5,
+    'letter': 0.5, '!=': 1.0, '++': 1.0, '--': 1.0, '+': 1.0, '<=': 1.0, "'a'": 0.5,
+    ' ': 50.0, '; ': 8.80, '{ ': 3.58, '} ': 2.68, 'if ': 2.53, 'for ': 2.20, 'int ': 1.93,
+    'int i': 1.54, '= 0;': 1.49, '(int': 1.40, 'cin ': 1.20, 'cout ': 1.20
+}
+
+# Verify MODEL_ARCHIVE
 if not MODEL_ARCHIVE.exists():
     logger.warning("Model archive %s not found, skipping spaCy model loading", MODEL_ARCHIVE)
 else:
@@ -107,7 +119,7 @@ class ValidationError(BaseModel):
 class HTTPValidationError(BaseModel):
     detail: List[ValidationError]
 
-# Helper function to check OpenRouter API health and get available models
+# Helper function to check OpenRouter API health
 def check_openrouter_health(api_key: str, base_url: str = "https://openrouter.ai/api/v1") -> Tuple[bool, List[str]]:
     try:
         if not api_key or not api_key.startswith("sk-or-v1-"):
@@ -115,11 +127,7 @@ def check_openrouter_health(api_key: str, base_url: str = "https://openrouter.ai
             return False, []
         masked_key = f"{api_key[:10]}...{api_key[-4:]}" if api_key else "None"
         logger.debug(f"Health check using API key: {masked_key}")
-        env_base_url = getenv("OPENROUTER_BASE_URL")
-        if env_base_url and env_base_url != base_url:
-            logger.warning(f"Environment OPENROUTER_BASE_URL ({env_base_url}) overridden with {base_url}")
         endpoint = f"{base_url.rstrip('/')}/models"
-        logger.debug(f"Checking OpenRouter API health at: {endpoint}")
         headers = {"Authorization": f"Bearer {api_key}"}
         response = requests.get(endpoint, headers=headers, timeout=5)
         response.raise_for_status()
@@ -144,20 +152,15 @@ def check_openrouter_health(api_key: str, base_url: str = "https://openrouter.ai
 # Startup and shutdown events
 @app.on_event("startup")
 async def startup_event():
-    # Validate environment variables
     api_key = getenv("OPENROUTER_API_KEY")
     base_url = "https://openrouter.ai/api/v1"
-    env_base_url = getenv("OPENROUTER_BASE_URL")
-    logger.debug(f"Environment OPENROUTER_BASE_URL: {env_base_url}, using: {base_url}")
     if not api_key or not api_key.startswith("sk-or-v1-"):
         logger.error("OPENROUTER_API_KEY is missing or invalid")
         raise RuntimeError("OPENROUTER_API_KEY is missing or invalid")
-    # Test OpenRouter API health
     is_healthy, models = check_openrouter_health(api_key, base_url)
     if not is_healthy:
         logger.error("Startup failed: OpenRouter API unavailable")
         raise RuntimeError("Startup failed: OpenRouter API unavailable")
-    # Store available models for use in query_api
     app.state.available_models = models
     logger.info(f"Available models: {models}")
 
@@ -174,18 +177,15 @@ async def cleanup():
     except Exception as e:
         logger.error(f"Failed to clean up: {str(e)}")
 
-# Query API function with enhanced error handling and fallback
+# Query API function
 def query_api(messages: List[Dict[str, str]], model: str = None, temp: float = 0.7, max_tokens: int = 2000) -> str:
-    # Validate API key
     api_key = getenv("OPENROUTER_API_KEY")
     if not api_key or not api_key.startswith("sk-or-v1-"):
         logger.error("OPENROUTER_API_KEY is missing or invalid in query_api")
         return ""
     masked_key = f"{api_key[:10]}...{api_key[-4:]}" if api_key else "None"
     logger.debug(f"Using API key: {masked_key} for query_api")
-    logger.debug(f"Authorization header: Bearer {masked_key}")
     
-    # Use a default model from available models if not specified
     if not model:
         available_models = getattr(app.state, "available_models", [])
         model = next((m for m in available_models if m == "moonshotai/kimi-k2:free"), "moonshotai/kimi-k2:free")
@@ -196,9 +196,7 @@ def query_api(messages: List[Dict[str, str]], model: str = None, temp: float = 0
     
     for current_model in models_to_try:
         try:
-            logger.debug(f"Sending API request to OpenRouter with model {current_model} and messages: {json.dumps(messages)[:100]}...")
-            request_url = f"{str(client.base_url).rstrip('/')}/chat/completions"
-            logger.debug(f"Request URL: {request_url}")
+            logger.debug(f"Sending API request to OpenRouter with model {current_model}")
             response = client.chat.completions.create(
                 model=current_model,
                 messages=messages,
@@ -206,229 +204,54 @@ def query_api(messages: List[Dict[str, str]], model: str = None, temp: float = 0
                 max_tokens=max_tokens,
                 response_format={"type": "json_object"}
             )
-            # Log response type
-            logger.debug(f"Response type: {type(response).__name__}")
             content = response.choices[0].message.content.strip()
-            logger.debug(f"Raw API response: {content[:500]}...")
             try:
                 parsed = json.loads(content)
                 code = parsed.get("code", "")
                 if not code:
-                    logger.error(f"No 'code' field in JSON response: {content[:1000]}")
-                    # Try regex as fallback
                     match = re.search(r"```cpp\n(.*?)```", content, re.DOTALL)
                     if match:
                         return match.group(1).strip()
-                    logger.error(f"No valid C++ code block found in API response: {content[:1000]}")
-                    return content.strip()  # Return raw content as last resort
+                    logger.error(f"No valid C++ code block found in API response")
+                    return content.strip()
                 return code.strip()
             except json.JSONDecodeError:
-                logger.error(f"Failed to parse JSON response: {content[:1000]}")
                 match = re.search(r"```cpp\n(.*?)```", content, re.DOTALL)
                 if not match:
-                    logger.error(f"No valid C++ code block found in API response: {content[:1000]}")
-                    return content.strip()  # Return raw content as last resort
+                    logger.error(f"No valid C++ code block found in API response")
+                    return content.strip()
                 return match.group(1).strip()
         except AuthenticationError as e:
-            logger.error(f"Authentication failed with model {current_model}: Invalid OpenRouter API key - {str(e)}")
-            # Attempt direct HTTP request as fallback
-            try:
-                headers = {
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json"
-                }
-                logger.debug(f"Fallback headers: {headers}")
-                payload = {
-                    "model": current_model,
-                    "messages": messages,
-                    "temperature": temp,
-                    "max_tokens": max_tokens,
-                    "response_format": {"type": "json_object"}
-                }
-                logger.debug(f"Sending fallback HTTP request for model {current_model}")
-                http_response = requests.post(request_url, headers=headers, json=payload, timeout=10)
-                logger.debug(f"Fallback HTTP status: {http_response.status_code}")
-                logger.debug(f"Fallback HTTP headers: {http_response.headers}")
-                logger.debug(f"Fallback HTTP response: {http_response.text[:1000]}...")
-                if http_response.status_code == 200:
-                    try:
-                        data = http_response.json()
-                        content = data['choices'][0]['message']['content'].strip()
-                        logger.debug(f"Fallback raw response: {content[:1000]}...")
-                        try:
-                            parsed = json.loads(content)
-                            code = parsed.get("code", "")
-                            if not code:
-                                logger.error(f"No 'code' field in fallback JSON response: {content[:1000]}")
-                                match = re.search(r"```cpp\n(.*?)```", content, re.DOTALL)
-                                if match:
-                                    return match.group(1).strip()
-                                logger.error(f"No valid C++ code block in fallback response: {content[:1000]}")
-                                return content.strip()
-                            return code.strip()
-                        except json.JSONDecodeError:
-                            logger.error(f"Failed to parse fallback JSON response: {content[:1000]}")
-                            match = re.search(r"```cpp\n(.*?)```", content, re.DOTALL)
-                            if not match:
-                                logger.error(f"No valid C++ code block in fallback response: {content[:1000]}")
-                                return content.strip()
-                            return match.group(1).strip()
-                    except Exception as e:
-                        logger.error(f"Failed to parse fallback response: {str(e)}")
-                        return ""
-                elif http_response.status_code == 401 and current_model != models_to_try[-1]:
-                    logger.warning(f"Fallback HTTP 401 with model {current_model}: {http_response.text[:1000]}. Retrying with next model")
-                    continue
-                elif (http_response.status_code == 404 or http_response.status_code == 429) and current_model != models_to_try[-1]:
-                    delay = 60.0  # Fixed 60-second delay
-                    if http_response.status_code == 429:
-                        logger.warning(f"Fallback rate limit headers: Limit={http_response.headers.get('X-RateLimit-Limit', 'N/A')}, "
-                                      f"Remaining={http_response.headers.get('X-RateLimit-Remaining', 'N/A')}, "
-                                      f"Reset={http_response.headers.get('X-RateLimit-Reset', 'N/A')}")
-                        logger.warning(f"Fallback rate limit exceeded with model {current_model}: {http_response.text[:1000]}. Waiting exactly {delay:.2f}s before retrying with next model")
-                    else:
-                        logger.warning(f"Fallback HTTP {http_response.status_code} with model {current_model}: {http_response.text[:1000]}. Waiting {delay:.2f}s before retrying with next model")
-                    time.sleep(delay)
-                    continue
-                else:
-                    logger.error(f"Fallback HTTP request failed with status {http_response.status_code}: {http_response.text[:1000]}")
-                    return ""
-            except Exception as e:
-                logger.error(f"Fallback HTTP request failed with model {current_model}: {str(e)}")
-                return ""
-        except APIError as e:
-            if ("401" in str(e) or "404" in str(e) or "429" in str(e)) and current_model != models_to_try[-1]:
-                delay = 60.0  # Fixed 60-second delay for 429 or 404, no delay for 401
-                if "401" in str(e):
-                    logger.warning(f"Authentication error with model {current_model}: {str(e)}. Retrying with next model")
-                elif "429" in str(e):
-                    try:
-                        error_json = e.response.json()
-                        logger.warning(f"Rate limit headers: Limit={error_json.get('error', {}).get('metadata', {}).get('headers', {}).get('X-RateLimit-Limit', 'N/A')}, "
-                                      f"Remaining={error_json.get('error', {}).get('metadata', {}).get('headers', {}).get('X-RateLimit-Remaining', 'N/A')}, "
-                                      f"Reset={error_json.get('error', {}).get('metadata', {}).get('headers', {}).get('X-RateLimit-Reset', 'N/A')}")
-                    except (ValueError, AttributeError) as parse_err:
-                        logger.error(f"Failed to parse rate limit headers: {str(parse_err)}")
-                    logger.warning(f"Rate limit exceeded for model {current_model}: {str(e)}. Waiting exactly {delay:.2f}s before retrying with next model")
-                    time.sleep(delay)
-                else:
-                    logger.warning(f"API error with model {current_model}: {str(e)}. Waiting {delay:.2f}s before retrying with next model")
-                    time.sleep(delay)
+            logger.error(f"Authentication failed with model {current_model}: {str(e)}")
+            if current_model != models_to_try[-1]:
+                logger.warning(f"Retrying with next model")
                 continue
-            logger.error(f"OpenRouter API error with model {current_model}: {str(e)}")
             return ""
         except RateLimitError as e:
             if current_model != models_to_try[-1]:
-                delay = 60.0  # Fixed 60-second delay
-                try:
-                    error_json = e.response.json()
-                    logger.warning(f"Rate limit headers: Limit={error_json.get('error', {}).get('metadata', {}).get('headers', {}).get('X-RateLimit-Limit', 'N/A')}, "
-                                  f"Remaining={error_json.get('error', {}).get('metadata', {}).get('headers', {}).get('X-RateLimit-Remaining', 'N/A')}, "
-                                  f"Reset={error_json.get('error', {}).get('metadata', {}).get('headers', {}).get('X-RateLimit-Reset', 'N/A')}")
-                except (ValueError, AttributeError) as parse_err:
-                    logger.error(f"Failed to parse rate limit headers: {str(parse_err)}")
-                logger.warning(f"Rate limit exceeded for model {current_model}: {str(e)}. Waiting exactly {delay:.2f}s before retrying with next model")
+                delay = 60.0
+                logger.warning(f"Rate limit exceeded for model {current_model}: {str(e)}. Waiting {delay:.2f}s")
                 time.sleep(delay)
                 continue
-            logger.error(f"Rate limit exceeded for OpenRouter API with model {current_model}: {str(e)}")
+            logger.error(f"Rate limit exceeded for all models: {str(e)}")
+            return ""
+        except APIError as e:
+            if ("401" in str(e) or "404" in str(e) or "429" in str(e)) and current_model != models_to_try[-1]:
+                delay = 60.0 if "429" in str(e) or "404" in str(e) else 0
+                logger.warning(f"API error with model {current_model}: {str(e)}. Waiting {delay:.2f}s")
+                time.sleep(delay)
+                continue
+            logger.error(f"OpenRouter API error with model {current_model}: {str(e)}")
             return ""
         except Exception as e:
             logger.error(f"Unexpected error in API query with model {current_model}: {str(e)}")
-            # Attempt direct HTTP request as fallback
-            try:
-                headers = {
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json"
-                }
-                logger.debug(f"Fallback headers: {headers}")
-                payload = {
-                    "model": current_model,
-                    "messages": messages,
-                    "temperature": temp,
-                    "max_tokens": max_tokens,
-                    "response_format": {"type": "json_object"}
-                }
-                logger.debug(f"Sending fallback HTTP request for model {current_model}")
-                http_response = requests.post(request_url, headers=headers, json=payload, timeout=10)
-                logger.debug(f"Fallback HTTP status: {http_response.status_code}")
-                logger.debug(f"Fallback HTTP headers: {http_response.headers}")
-                logger.debug(f"Fallback HTTP response: {http_response.text[:1000]}...")
-                if http_response.status_code == 200:
-                    try:
-                        data = http_response.json()
-                        content = data['choices'][0]['message']['content'].strip()
-                        logger.debug(f"Fallback raw response: {content[:1000]}...")
-                        try:
-                            parsed = json.loads(content)
-                            code = parsed.get("code", "")
-                            if not code:
-                                logger.error(f"No 'code' field in fallback JSON response: {content[:1000]}")
-                                match = re.search(r"```cpp\n(.*?)```", content, re.DOTALL)
-                                if match:
-                                    return match.group(1).strip()
-                                logger.error(f"No valid C++ code block in fallback response: {content[:1000]}")
-                                return content.strip()
-                            return code.strip()
-                        except json.JSONDecodeError:
-                            logger.error(f"Failed to parse fallback JSON response: {content[:1000]}")
-                            match = re.search(r"```cpp\n(.*?)```", content, re.DOTALL)
-                            if not match:
-                                logger.error(f"No valid C++ code block in fallback response: {content[:1000]}")
-                                return content.strip()
-                            return match.group(1).strip()
-                    except Exception as e:
-                        logger.error(f"Failed to parse fallback response: {str(e)}")
-                        return ""
-                elif http_response.status_code == 401 and current_model != models_to_try[-1]:
-                    logger.warning(f"Fallback HTTP 401 with model {current_model}: {http_response.text[:1000]}. Retrying with next model")
-                    continue
-                elif (http_response.status_code == 404 or http_response.status_code == 429) and current_model != models_to_try[-1]:
-                    delay = 60.0  # Fixed 60-second delay
-                    if http_response.status_code == 429:
-                        logger.warning(f"Fallback rate limit headers: Limit={http_response.headers.get('X-RateLimit-Limit', 'N/A')}, "
-                                      f"Remaining={http_response.headers.get('X-RateLimit-Remaining', 'N/A')}, "
-                                      f"Reset={http_response.headers.get('X-RateLimit-Reset', 'N/A')}")
-                        logger.warning(f"Fallback rate limit exceeded with model {current_model}: {http_response.text[:1000]}. Waiting exactly {delay:.2f}s before retrying with next model")
-                    else:
-                        logger.warning(f"Fallback HTTP {http_response.status_code} with model {current_model}: {http_response.text[:1000]}. Waiting {delay:.2f}s before retrying with next model")
-                    time.sleep(delay)
-                    continue
-                else:
-                    logger.error(f"Fallback HTTP request failed with status {http_response.status_code}: {http_response.text[:1000]}")
-                    return ""
-            except Exception as e:
-                logger.error(f"Fallback HTTP request failed with model {current_model}: {str(e)}")
-                return ""
+            if current_model != models_to_try[-1]:
+                continue
+            return ""
     logger.error(f"All models failed: {models_to_try}")
-    return ""  # Return empty string if all attempts fail
+    return ""
 
-# Health check endpoint
-@app.get("/health", response_model=HealthResponse)
-async def health_check():
-    try:
-        base_url = "https://openrouter.ai/api/v1"
-        api_key = getenv("OPENROUTER_API_KEY")
-        if not api_key or not api_key.startswith("sk-or-v1-"):
-            logger.error("OPENROUTER_API_KEY is missing or invalid in health check")
-            return {"status": "unhealthy", "error": "Invalid or missing API key"}
-        masked_key = f"{api_key[:10]}...{api_key[-4:]}" if api_key else "None"
-        logger.debug(f"Health check using API key: {masked_key}")
-        env_base_url = getenv("OPENROUTER_BASE_URL")
-        if env_base_url and env_base_url != base_url:
-            logger.warning(f"Environment OPENROUTER_BASE_URL ({env_base_url}) overridden with {base_url}")
-        endpoint = f"{base_url.rstrip('/')}/models"
-        logger.debug(f"Health check requesting: {endpoint}")
-        headers = {"Authorization": f"Bearer {api_key}"}
-        response = requests.get(endpoint, headers=headers, timeout=5)
-        response.raise_for_status()
-        data = response.json()
-        model_ids = [model["id"] for model in data["data"]]
-        return {"status": "healthy", "models": model_ids}
-    except Exception as e:
-        logger.error(f"Health check failed: {str(e)}")
-        return {"status": "unhealthy", "error": str(e)}
-
-# Existing functions (unchanged)
+# Code processing functions
 def clean_code(code: str, preserve_comments: bool = False) -> str:
     if not code:
         return ""
@@ -437,12 +260,90 @@ def clean_code(code: str, preserve_comments: bool = False) -> str:
         code = re.sub(r'/\*.*?\*/', '', code, flags=re.DOTALL)
     return re.sub(r'\s+', ' ', code).strip()
 
-def tokenize_code(line: str) -> List[str]:
-    if not line:
+def tokenize_code(code: str) -> List[str]:
+    if not code:
         return []
-    line = re.sub(r'//.*$', '', line)
-    line = re.sub(r'/\*.*?\*/', '', line, flags=re.DOTALL)
-    return re.findall(r'[a-zA-Z_][a-zA-Z0-9_]*|[{}();,=<>+\-*&]|[0-9]+', line)
+    tokens = []
+    current = ""
+    i = 0
+    while i < len(code):
+        if code[i].isspace():
+            if current:
+                tokens.append(current)
+                current = ""
+            whitespace = ""
+            while i < len(code) and code[i].isspace():
+                whitespace += code[i]
+                i += 1
+            if whitespace:
+                tokens.append(' ')
+            continue
+        elif code[i] in '();,=+-*/{}<>!':
+            if current:
+                tokens.append(current)
+                current = ""
+            if i + 1 < len(code) and code[i:i + 2] in ('>>', '<<', '++', '--', '!=', '<='):
+                tokens.append(code[i:i + 2])
+                i += 2
+            else:
+                tokens.append(code[i])
+                i += 1
+        else:
+            current += code[i]
+            i += 1
+    if current:
+        tokens.append(current)
+
+    merged = []
+    i = 0
+    while i < len(tokens):
+        for length in range(5, 0, -1):
+            if i + length <= len(tokens):
+                sequence = ''.join(tokens[i:i + length])
+                if sequence in HUMAN_FREQUENCIES:
+                    merged.append(sequence)
+                    i += length
+                    break
+        else:
+            merged.append(tokens[i])
+            i += 1
+    return merged
+
+def compute_frequency_features(code: str) -> Dict[str, float]:
+    tokens = tokenize_code(code)
+    total_chars = sum(len(str(t)) for t in tokens)
+    if total_chars == 0:
+        return {}
+    token_counts = Counter(tokens)
+    return {token: (count / total_chars) * 1000 for token, count in token_counts.items()}
+
+def classify_code(code: str, handle: str) -> Tuple[bool, str, float, str]:
+    if not code.strip():
+        return False, "Code cannot be empty", 0.0, handle
+    code_freq = compute_frequency_features(code)
+    if not code_freq:
+        return False, "Empty code after tokenization", 0.0, handle
+    deviation = 0.0
+    matched_tokens = 0
+    deviation_details = []
+    for token, expected_freq in HUMAN_FREQUENCIES.items():
+        actual_freq = code_freq.get(token, 0)
+        diff = (actual_freq - expected_freq) ** 2
+        deviation += diff
+        matched_tokens += 1
+        if diff > 0:
+            deviation_details.append(f"Token '{token}': expected {expected_freq:.2f}, actual {actual_freq:.2f}, diff {diff:.2f}")
+    for token, actual_freq in code_freq.items():
+        if token not in HUMAN_FREQUENCIES:
+            penalty = 1.5 if token in ('z', 'q', 'w') else 0.5
+            diff = actual_freq ** 2 * penalty
+            deviation += diff
+            deviation_details.append(f"Unknown token '{token}': freq {actual_freq:.2f}, penalty {penalty}, diff {diff:.2f}")
+    deviation = math.sqrt(deviation / max(matched_tokens, 1))
+    threshold = 30.0
+    confidence = min(0.99, 1.0 / (1.0 + math.exp(-0.05 * (threshold - deviation))))
+    label = "Human" if deviation < threshold else "AI"
+    return True, label, confidence, handle
 
 def extract_variables(code: str) -> Tuple[List[str], bool]:
     primitives = {"int", "long", "short", "float", "double", "char", "bool", "void", "auto", "unsigned", "signed", "size_t"}
@@ -457,13 +358,16 @@ def extract_variables(code: str) -> Tuple[List[str], bool]:
             if type_str and j < len(tokens):
                 i = j
                 while i < len(tokens) and tokens[i] != ";":
-                    if (tokens[i] not in ("*", "&", ",", "=", "(", ")") and
-                        tokens[i] not in keywords and
-                        tokens[i] not in primitives and
-                        tokens[i] not in containers and
-                        not tokens[i].isdigit()):
-                        variables.add(tokens[i])
+                    name = tokens[i]
                     i += 1
+                    while i < len(tokens) and tokens[i] in ("*", "&", ",", "="):
+                        if tokens[i] == "=" and i + 1 < len(tokens):
+                            i += 1
+                        i += 1
+                        name = tokens[i] if i < len(tokens) else ""
+                        i += 1
+                    if name and name != "(" and name not in keywords and name not in primitives and name not in containers and not name.isdigit():
+                        variables.add(name)
             else:
                 i += 1
     var_list = sorted(variables)
@@ -496,12 +400,12 @@ def has_suspicious_comments(code: str) -> bool:
     if not code:
         return False
     lines = code.splitlines()
-    comment_count = sum(1 for line in lines if re.search(r'//(.{%d,})' % CONFIG["comment_length"], line))
-    total_blocks = max(1, len(lines) // CONFIG["comment_block"])
-    return comment_count < total_blocks
-
-def preprocess_code(code: str, handle: str) -> str:
-    return clean_code(code) + " " + handle
+    for i in range(0, len(lines), CONFIG["comment_block"]):
+        block = lines[i:i + CONFIG["comment_block"]]
+        has_long_comment = any(re.search(r'//(.{%d,})' % CONFIG["comment_length"], line) for line in block)
+        if not has_long_comment:
+            return True
+    return False
 
 def pad_string(text: str) -> str:
     if not text:
@@ -539,8 +443,8 @@ def matrix_avg_distance(matrix: List[List[int]]) -> float:
         return 0.0
     rows, cols = len(matrix), len(matrix[0])
     center_r, center_c = rows // 2, cols // 2
-    total = sum((i - center_r) ** 2 + (j - center_c) ** 2 for i in range(rows) for j in range(cols))
-    return total / (rows * cols) ** 0.5 if rows * cols > 0 else 0.0
+    total = sum(((i - center_r) ** 2 + (j - center_c) ** 2) ** 0.5 for i in range(rows) for j in range(cols))
+    return total / (rows * cols) if rows * cols > 0 else 0.0
 
 def compute_global_distance(matrix: List[List[int]]) -> float:
     if not matrix or not matrix[0]:
@@ -579,211 +483,219 @@ def lcs_length(str1: str, str2: str) -> int:
     return prev[m]
 
 def compare_codes(code1: str, code2: str) -> Tuple[bool, str]:
-    code1_clean, code2_clean = clean_code(code1), clean_code(code2)
-    if not code1_clean or not code2_clean:
+    if not code1 or not code2:
         return False, "Empty code"
-    lcs_score = lcs_length(code1_clean, code2_clean)
-    lcs_ratio = lcs_score / min(len(code1_clean), len(code2_clean)) if code1_clean and code2_clean else 0
-    return lcs_ratio >= CONFIG["lcs_threshold"], f"LCS: {lcs_ratio:.2f}"
+    cleaned1, cleaned2 = clean_code(code1), clean_code(code2)
+    lcs_score = lcs_length(cleaned1, cleaned2)
+    lcs_ratio = lcs_score / min(len(cleaned1), len(cleaned2)) if cleaned1 and cleaned2 else 0
+    hash1, hash2 = compute_hash(code1), compute_hash(code2)
+    common_hashes = len(set(hash1) & set(hash2))
+    hash_ratio = common_hashes / min(len(hash1), len(hash2)) if hash1 and hash2 else 0
+    is_similar = lcs_ratio >= CONFIG["lcs_threshold"] or hash_ratio >= CONFIG["hash_threshold"]
+    return is_similar, f"LCS: {lcs_ratio:.2f}, Hash: {hash_ratio:.2f}"
 
-async def analyze_code_with_generated(code: str, generated: str) -> Tuple[bool, float, str]:
-    if not code or not generated:
-        return False, 0.0, "Empty code or generated code"
-    original_matrix = string_to_matrix(pad_string(code))
-    generated_matrix = string_to_matrix(pad_string(generated))
-    delta = abs(compute_global_distance(original_matrix) - compute_global_distance(generated_matrix))
-    return delta < CONFIG["delta_threshold"], delta, f"Delta: {delta:.4f}"
-
-async def detect_plagiarism_with_generated(code: str, generated: str) -> Tuple[bool, float, str, str, List[str]]:
-    if not code or not generated:
-        return False, 0.0, "Empty code or generated code", "N", ["Empty code or generated code"]
-    original_matrix = string_to_matrix(pad_string(code))
-    generated_matrix = string_to_matrix(pad_string(generated))
-    delta = abs(compute_global_distance(original_matrix) - compute_global_distance(generated_matrix))
-    is_similar, lcs_details = compare_codes(code, generated)
-    evidence = [f"Delta: {delta:.4f}", lcs_details]
-    is_plagiarized = delta < CONFIG["plagiarism_threshold"] or is_similar
-    return is_plagiarized, delta, f"Delta: {delta:.4f}", "S" if is_similar else "N", evidence
-
-async def classify_code(code: str, handle: str) -> Tuple[bool, str, float, str]:
-    if not code.strip():
-        return False, "Code cannot be empty", 0.0, handle
-    cleaned = clean_code(code)
-    messages = [
+async def detect_plagiarism(code: str, handle: str) -> Tuple[bool, float, str, str, List[str]]:
+    if not code:
+        return False, 0.0, "Empty code", "N", ["Empty code"]
+    cleaned_code = clean_code(code)
+    intent_prompt = [
+        {"role": "system", "content": "Analyze the following C++ code and describe its purpose in a concise manner."},
+        {"role": "user", "content": f"```cpp\n{code}\n```"}
+    ]
+    intent = query_api(intent_prompt)
+    if not intent:
+        return False, 0.0, "Failed to get intent", "N", ["Failed to get intent"]
+    generate_prompt = [
         {
             "role": "system",
             "content": (
-                "You are an expert C++ programmer. Generate C++ code that replicates the functionality of the provided code. "
-                "Ensure the code is complete, syntactically correct, and uses modern C++ practices. you just get the input code and get its intent, then you write a new whole code to do same thing but in your way"
+                "You are an expert C++ programmer. Generate C++ code that solves the same problem as described below. "
+                "Ensure the code is complete, syntactically correct, and uses modern C++ practices. "
                 "Wrap the generated code in a ```cpp code block, like this:\n"
-                "```cpp\n"
-                "// Your code here\n"
-                "```\n"
-                "Do not include explanations or comments outside the code block unless explicitly requested or are already in input code."
+                "```cpp\n// Your code here\n```\n"
+                "Do not include explanations or comments outside the code block."
             )
         },
-        {"role": "user", "content": code}
+        {"role": "user", "content": intent}
     ]
-    try:
-        generated = query_api(messages)
-        if not generated:
-            return False, "Failed to generate code from API. Please check API key or model availability.", 0.0, handle
-        is_similar = compare_codes(cleaned, clean_code(generated))[0]
-        return True, "H" if is_similar else "AI", 0.0, handle
-    except Exception as e:
-        logger.error(f"Code classification failed: {str(e)}")
-        return False, f"Classification error: {str(e)}", 0.0, handle
+    generated_code = query_api(generate_prompt)
+    match = re.search(r"```cpp\n(.*?)```", generated_code, re.DOTALL)
+    generated_code = match.group(1).strip() if match else generated_code.strip()
+    if not generated_code:
+        return False, 0.0, "No generated code", "N", ["No generated code"]
+    matrix1 = string_to_matrix(pad_string(cleaned_code))
+    matrix2 = string_to_matrix(pad_string(generated_code))
+    delta = abs(compute_global_distance(matrix1) - compute_global_distance(matrix2))
+    lcs_score = lcs_length(cleaned_code, clean_code(generated_code))
+    lcs_ratio = lcs_score / min(len(cleaned_code), len(clean_code(generated_code))) if cleaned_code else 0
+    evidence = [f"Delta: {delta:.4f}", f"LCS: {lcs_ratio:.2f}"]
+    is_plagiarized = delta < CONFIG["plagiarism_threshold"] or lcs_ratio >= CONFIG["lcs_threshold"]
+    return is_plagiarized, delta, f"Delta: {delta:.4f}", "S" if is_plagiarized else "N", evidence
 
-def process_code_submission(code: str, handle: str):
+def process_code_submission(code: str, handle: str) -> None:
     try:
-        if INPUT_1568.exists():
-            INPUT_1568.unlink()
-        with open(INPUT_1568, "w") as f:
-            f.write(code.strip() + "\n")
-            f.write("R77q\n")
-            f.write(f"{handle}$")
-        
         cleaned_code = clean_code(code)
         if not cleaned_code:
-            logger.warning(f"Empty code after cleaning for handle {handle}")
-            return
-        
-        formatted_code = f"xc9@{handle}\n{cleaned_code}\n"
-        with open(INPUT_1435, "w") as f:
-            f.write(formatted_code)
-        logger.info(f"Processed code for handle {handle} and written to {INPUT_1435}")
-    except Exception as e:
-        logger.error(f"Failed to process code for handle {handle}: {str(e)}")
+            raise ValueError("Empty code after cleaning")
+        with INPUT_1568.open("w", encoding="utf-8") as f:
+            f.write(f"{cleaned_code}\nRqq7\n{handle}\n")
+        with INPUT_1435.open("a+", encoding="utf-8") as f:
+            f.seek(0)
+            lines = f.readlines()
+            count = len([line for line in lines if line.strip() and not line.startswith("Rqq7")])
+            f.write(f"xc9@{handle}\n{cleaned_code}\n")
+        with INPUT_1435.open("r+", encoding="utf-8") as f:
+            lines = f.readlines()
+            f.seek(0)
+            f.write(f"{count + 1}\n")
+            f.writelines(lines)
+        logger.info(f"Processed code for handle {handle}")
+    except (IOError, ValueError) as e:
+        logger.error(f"Failed to process submission: {e}")
         raise
 
 def detect_similar_codes(code: str, handle: str) -> List[str]:
     try:
-        with open(OUTPUT_1435, "w") as f:
-            f.write("0 similar pairs of codes detected\n\n0 cheaters detected:\n")
-        return []
-    except Exception as e:
-        logger.error(f"Failed to detect similar codes: {str(e)}")
-        return []
-
-def prepend_code_count():
-    try:
+        similar_handles = []
         if not INPUT_1435.exists():
-            logger.error("input1435.txt not found")
-            return
-        with open(INPUT_1435, "r") as f:
+            logger.warning("input1435.txt not found for similarity check")
+            return []
+        with INPUT_1435.open("r", encoding="utf-8") as f:
             lines = f.readlines()
-        code_count = 1
-        with open(INPUT_1435, "w") as f:
-            f.write(f"{code_count}\n")
-            f.writelines(lines)
-        logger.info(f"Prepended code count {code_count} to input1435.txt")
+        current_code = None
+        current_handle = None
+        codes = {}
+        for line in lines:
+            if line.startswith("xc9@"):
+                current_handle = line[4:].strip()
+            elif current_handle and line.strip() and not line.startswith("Rqq7"):
+                current_code = line.strip()
+                if current_handle != handle:
+                    codes[current_handle] = current_code
+        cleaned_code = clean_code(code)
+        for other_handle, other_code in codes.items():
+            is_similar, details = compare_codes(cleaned_code, other_code)
+            if is_similar:
+                similar_handles.append(f"{other_handle}: {details}")
+        with OUTPUT_1435.open("w", encoding="utf-8") as f:
+            if similar_handles:
+                f.write(f"{len(similar_handles)} similar pairs of codes detected\n\n")
+                f.write(f"{len(similar_handles)} cheaters detected:\n")
+                f.write("\n".join(similar_handles) + "\n")
+            else:
+                f.write("0 similar pairs of codes detected\n\n0 cheaters detected:\n")
+        return similar_handles
     except Exception as e:
-        logger.error(f"Failed to prepend code count: {str(e)}")
-        raise
+        logger.error(f"Failed to detect similar codes: {e}")
+        return []
 
-def generate_report(analysis: Dict[str, Any], issues: List[str], handle: str, 
-                   model1_result: Optional[Tuple[str, List[str]]] = None, 
+def generate_report(analysis: Dict[str, Any], issues: List[str], handle: str,
+                   model1_result: Optional[Tuple[str, List[str]]] = None,
                    model2_result: Optional[Tuple[str, List[str]]] = None) -> str:
-    report = f"Report for {handle}\n\n"
-    report += f"AI/Human Classification:\nLabel: {analysis['label']} (Confidence: {analysis['confidence']:.2%})\n"
-    report += "Issues:\n" + ("\n".join([f"- {x}" for x in issues]) if issues else "- None\n")
+    report = f"Plagiarism Report for {handle}\n\n"
+    report += "AI/Human Classification:\n"
+    report += f"Label: {analysis['label']} (Confidence: {analysis['confidence']:.2%})\n"
+    report += "Suspicious Patterns:\n"
+    report += "\n".join([f"- {x}" for x in issues]) if issues else "- None\n"
     if model1_result:
-        report += f"\nBasic Plagiarism Check (Python):\nSimilarity: {model1_result[0]}\nEvidence:\n" + "\n".join([f"- {x}" for x in model1_result[1]]) + "\n"
+        report += "\nCode Similarity (Model 1):\n"
+        report += f"Similar: {model1_result[0]}\nEvidence:\n" + "\n".join([f"- {x}" for x in model1_result[1]]) + "\n"
     if model2_result:
-        report += f"\nAdvanced Plagiarism Check (Python):\nSimilarity: {model2_result[0]}\nEvidence:\n" + "\n".join([f"- {x}" for x in model2_result[1]]) + "\n"
-    report += "\nCode Similarity Check (Python):\nSimilar to handles: None\n"
-    
+        report += "\nCode Similarity (Model 2):\n"
+        report += f"Similar: {model2_result[0]}\nEvidence:\n" + "\n".join([f"- {x}" for x in model2_result[1]]) + "\n"
+    report += f"\nCode Similarity Check:\nSimilar to handles: {', '.join(analysis.get('similar_handles', [])) or 'None'}\n"
     flags = sum(1 for x in [
         analysis['label'] == "AI",
         model1_result and model1_result[0] == "S",
-        model2_result and model2_result[0] == "S"
+        model2_result and model2_result[0] == "S",
+        analysis.get('similar_handles', [])
     ] if x)
-    report += f"\nConclusion:\n- {'AI or Plagiarized' if flags >= 2 else 'Human'}\n"
+    verdict = "AI-generated or Plagiarized" if flags >= 2 else "Human-written"
+    report += f"\nConclusion:\n- {verdict}\n"
     report += "\nRecommendations:\n"
-    if flags >= 2:
-        report += "- Review for AI usage or plagiarism.\n- Verify code authenticity.\n"
+    if verdict == "AI-generated or Plagiarized":
+        report += "- Review for AI usage or plagiarism.\n- Verify submission authenticity.\n"
         if analysis['label'] == "AI":
-            report += "- Discuss AI usage with author.\n"
-        if (model1_result and model1_result[0] == "S") or (model2_result and model2_result[0] == "S"):
-            report += "- Investigate potential plagiarism.\n"
+            report += "- Discuss potential AI generation with submitter.\n"
+        if (model1_result and model1_result[0] == "S") or (model2_result and model2_result[0] == "S") or analysis.get('similar_handles', []):
+            report += "- Investigate potential code copying.\n"
     else:
-        report += "- Likely human-authored.\n"
+        report += "- No further action required.\n"
     return report
 
+# Endpoints
 @app.get("/", response_class=HTMLResponse)
-async def get_index(request: Request):
+async def index(request: Request):
     return templates.TemplateResponse("index.html", {"request": request})
 
-@app.post("/a", response_class=HTMLResponse, responses={
+@app.get("/health", response_model=HealthResponse)
+async def health_check():
+    try:
+        api_key = getenv("OPENROUTER_API_KEY")
+        if not api_key or not api_key.startswith("sk-or-v1-"):
+            logger.error("OPENROUTER_API_KEY is missing or invalid in health check")
+            return {"status": "unhealthy", "error": "Invalid or missing API key"}
+        is_healthy, models = check_openrouter_health(api_key)
+        if not is_healthy:
+            return {"status": "unhealthy", "error": "OpenRouter API unavailable"}
+        return {"status": "healthy", "models": models}
+    except Exception as e:
+        logger.error(f"Health check failed: {str(e)}")
+        return {"status": "unhealthy", "error": str(e)}
+
+@app.post("/analyze", response_class=HTMLResponse, responses={
     200: {"content": {"text/html": {}}},
     422: {"model": HTTPValidationError}
 })
-async def analyze_code_form(request: Request, code: str = Form(..., max_length=100_000), handle: str = Form("triumph")):
+async def analyze_code(request: Request, code: str = Form(..., max_length=100_000), handle: str = Form("triumph")):
     try:
-        if not code.strip():
-            return templates.TemplateResponse("index.html", {"request": request, "error": "Code cannot be empty"})
-        
-        # Validate handle
         SingleCodeInput(code=code, handle=handle)
-        
-        # Check API health
         health = await health_check()
         if health["status"] != "healthy":
-            logger.error(f"OpenRouter API unavailable: {health.get('error', 'Unknown error')}")
-            return templates.TemplateResponse("index.html", {"request": request, "error": f"OpenRouter API is unavailable: {health.get('error', 'Unknown error')}"})
+            return templates.TemplateResponse("index.html", {"request": request, "error": f"OpenRouter API unavailable: {health.get('error', 'Unknown error')}"})
         
-        # Run Python-based analysis
-        logger.debug(f"Processing code (first 100 chars): {code[:100]}...")
-        success, label, confidence, handle = await classify_code(code, handle)
+        success, label, confidence, handle = classify_code(code, handle)  # Removed await
         if not success:
             return templates.TemplateResponse("index.html", {"request": request, "error": label})
         variables, has_long_vars = extract_variables(code)
-        issues = [f"Variables longer than {CONFIG['var_length']} characters" if has_long_vars else "",
-                  "Suspicious comments" if has_suspicious_comments(code) else ""]
+        issues = [
+            f"Variables longer than {CONFIG['var_length']} characters" if has_long_vars else "",
+            "Suspicious comments" if has_suspicious_comments(code) else ""
+        ]
         issues = [x for x in issues if x]
         
-        # Call query_api once
-        messages = [
-            {
-                "role": "system",
-                "content": (
-                    "You are an expert C++ programmer. Generate C++ code that replicates the functionality of the provided code. "
-                    "Ensure the code is complete, syntactically correct, and uses modern C++ practices. "
-                    "Wrap the generated code in a ```cpp code block, like this:\n"
-                    "```cpp\n"
-                    "// Your code here\n"
-                    "```\n"
-                    "Do not include explanations or comments outside the code block unless explicitly requested."
-                )
-            },
-            {"role": "user", "content": code}
-        ]
-        generated = query_api(messages)
-        if not generated:
-            error_msg = "Failed to generate code from API. Please check the API key or model availability."
-            logger.error(error_msg)
-            return templates.TemplateResponse("index.html", {"request": request, "error": error_msg})
+        is_plagiarized, delta, delta_details, sim_status, evidence = await detect_plagiarism(code, handle)
+        model1_result = ("S" if is_plagiarized else "N", [delta_details])
+        model2_result = (sim_status, evidence)
+        similar_handles = detect_similar_codes(code, handle)
         
-        # Use generated code for both analyses
-        is_similar, delta, delta_details = await analyze_code_with_generated(code, generated)
-        model1_result = ("S" if is_similar else "N", [delta_details])
-        is_plagiarized, delta, delta_details, sim_status, evidence = await detect_plagiarism_with_generated(code, generated)
-        model2_result = ("S" if is_plagiarized else "N", [delta_details] + evidence)
-        
-        # Process code
         process_code_submission(code, handle)
-        prepend_code_count()
-        c_similar_handles = detect_similar_codes(code, handle)
-        
-        analysis = {"label": label, "confidence": confidence}
+        analysis = {"label": label, "confidence": confidence, "similar_handles": similar_handles}
         report = generate_report(analysis, issues, handle, model1_result, model2_result)
+        
+        with OUTPUT_1435.open("a+", encoding="utf-8") as f:
+            f.write(f"Handle: {handle} ({label}-generated)\n")
+            f.write(f"Confidence: {confidence:.2%}\n")
+            f.write(f"Plagiarism: {'Detected' if is_plagiarized else 'Not detected'}\n")
+            f.write("\n".join(evidence) + "\n\n")
+        
         return templates.TemplateResponse("index.html", {
             "request": request,
             "result": {"handle": handle, "report": report, "confidence": confidence, "label": label}
         })
     except Exception as e:
-        logger.error(f"Analyze form endpoint failed: {str(e)}")
-        return templates.TemplateResponse("index.html", {"request": request, "error": f"Analyze form failed: {str(e)}"})
+        logger.error(f"Analyze code failed: {str(e)}")
+        return templates.TemplateResponse("index.html", {"request": request, "error": f"Analyze code failed: {str(e)}"})
+
+@app.post("/prepare", response_class=HTMLResponse)
+async def prepare_submission(request: Request, code: str = Form(...), handle: str = Form(...)):
+    try:
+        SingleCodeInput(code=code, handle=handle)
+        process_code_submission(code, handle)
+        return templates.TemplateResponse("index.html", {"request": request, "message": f"Code for {handle} prepared"})
+    except Exception as e:
+        logger.error(f"Prepare submission failed: {e}")
+        return templates.TemplateResponse("index.html", {"request": request, "error": f"Prepare submission failed: {str(e)}"})
 
 if __name__ == "__main__":
     import uvicorn
