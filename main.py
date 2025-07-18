@@ -6,12 +6,12 @@ import logging
 from pathlib import Path
 from typing import List, Tuple, Dict, Any, Optional
 import numpy as np
-from fastapi import FastAPI, Form, Request
+from fastapi import FastAPI, Form, Request, HTTPException, Depends
 from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, validator
-import py7zr
+from pydantic import BaseModel, validator, EmailStr
+from py7zr import SevenZipFile
 import tempfile
 import shutil
 from os import environ, getenv
@@ -22,6 +22,19 @@ import time
 import datetime
 from collections import Counter
 import math
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from jose import JWTError, jwt
+from passlib.context import CryptContext
+from datetime import datetime, timedelta
+from fastapi_limiter import FastAPILimiter
+from fastapi_limiter.depends import RateLimiter
+import redis.asyncio as redis
+import tensorflow as tf
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense, Embedding
+from tensorflow.keras.preprocessing.text import Tokenizer
+from tensorflow.keras.preprocessing.sequence import pad_sequences
+import clang.cindex as clang
 
 # Logging setup
 valid_log_levels = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
@@ -33,22 +46,32 @@ logger = logging.getLogger(__name__)
 
 # Load environment variables
 load_dotenv()
-
-# Initialize OpenAI client with OpenRouter credentials
-env_base_url = getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
-correct_base_url = env_base_url if env_base_url.endswith("/v1") else "https://openrouter.ai/api/v1"
-if env_base_url != correct_base_url:
-    logger.warning(f"Environment OPENROUTER_BASE_URL ({env_base_url}) overridden with {correct_base_url}")
 api_key = getenv("OPENROUTER_API_KEY")
 if not api_key or not api_key.startswith("sk-or-v1-"):
     logger.error("OPENROUTER_API_KEY is missing or invalid")
     raise RuntimeError("OPENROUTER_API_KEY is missing or invalid")
-masked_key = f"{api_key[:10]}...{api_key[-4:]}" if api_key else "None"
-logger.info(f"Loaded OPENROUTER_API_KEY: {masked_key}")
-client = OpenAI(base_url=correct_base_url, api_key=api_key)
+secret_key = getenv("SECRET_KEY")
+if not secret_key:
+    logger.error("SECRET_KEY is missing")
+    raise RuntimeError("SECRET_KEY is missing")
+
+# Initialize Redis
+try:
+    redis_client = redis.Redis(host='localhost', port=6379, db=0, decode_responses=True)
+    redis_client.ping()
+except redis.ConnectionError as e:
+    logger.error(f"Failed to connect to Redis: {e}")
+    raise RuntimeError("Redis server is not running or accessible")
 
 # Initialize FastAPI app
 app = FastAPI(title="Code Plagiarism Detector", version="0.1.0")
+
+# Security setup
+SECRET_KEY = secret_key
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 30
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 
 # Configuration
 BASE_DIR = Path(__file__).resolve().parent
@@ -59,6 +82,9 @@ TEMP_MODEL_DIR = Path(tempfile.mkdtemp())
 INPUT_1568 = BASE_DIR / "input1568.txt"
 INPUT_1435 = BASE_DIR / "input1435.txt"
 OUTPUT_1435 = BASE_DIR / "output1435.txt"
+INTERACTION_LOG = BASE_DIR / "interaction_log.json"
+BANNED_IPS = BASE_DIR / "banned_ips.txt"
+LSTM_MODEL_PATH = BASE_DIR / "lstm_plagiarism_model.h5"
 
 CONFIG = {
     "lcs_threshold": 0.5,
@@ -68,6 +94,9 @@ CONFIG = {
     "comment_block": 5,
     "delta_threshold": 0.10,
     "plagiarism_threshold": 0.10,
+    "similarity_threshold": 0.9,
+    "ast_similarity_threshold": 0.85,
+    "max_logins_per_email": 2,
 }
 
 # Token frequencies from Codeforces
@@ -85,20 +114,35 @@ HUMAN_FREQUENCIES = {
     'int i': 1.54, '= 0;': 1.49, '(int': 1.40, 'cin ': 1.20, 'cout ': 1.20
 }
 
-# Verify MODEL_ARCHIVE
-if not MODEL_ARCHIVE.exists():
-    logger.warning("Model archive %s not found, skipping spaCy model loading", MODEL_ARCHIVE)
-else:
-    logger.info("Confirmed model.7z exists at %s, but skipping spaCy due to memory constraints", MODEL_ARCHIVE)
+# Initialize OpenAI client
+client = OpenAI(base_url="https://openrouter.ai/api/v1", api_key=api_key)
 
 # Mount static files and templates
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 templates = Jinja2Templates(directory=TEMPLATES_DIR)
 
 # Pydantic models
+class UserRegister(BaseModel):
+    email1: EmailStr
+    email2: EmailStr
+    password: str
+    handle: str
+    @validator("handle")
+    def validate_handle(cls, v):
+        if not v.strip() or any(c in v for c in "\n$"):
+            raise ValueError("Handle must be non-empty and not contain newlines or '$'")
+        if not re.match(r'^[a-zA-Z0-9_]+$', v):
+            raise ValueError("Handle must be alphanumeric or underscores")
+        return v
+    @validator("email2")
+    def emails_different(cls, v, values):
+        if "email1" in values and v == values["email1"]:
+            raise ValueError("Second email must be different from first email")
+        return v
+
 class SingleCodeInput(BaseModel):
     code: str
-    handle: str = "triumph"
+    handle: str
     @validator("handle")
     def validate_handle(cls, v):
         if not v.strip() or any(c in v for c in "\n$"):
@@ -107,26 +151,185 @@ class SingleCodeInput(BaseModel):
             raise ValueError("Handle must be alphanumeric or underscores")
         return v
 
+class Token(BaseModel):
+    access_token: str
+    token_type: str
+
 class HealthResponse(BaseModel):
     status: str
     models: List[str] = []
 
-class ValidationError(BaseModel):
-    loc: List[str]
-    msg: str
-    type: str
+# User database
+users_db: Dict[str, Dict[str, Any]] = {}
+email_usage: Dict[str, int] = {}
 
-class HTTPValidationError(BaseModel):
-    detail: List[ValidationError]
+# LSTM model setup
+tokenizer = Tokenizer()
+lstm_model = None
+MAX_SEQUENCE_LENGTH = 1000
 
-# Helper function to check OpenRouter API health
+def init_lstm_model(vocab_size: int = 10000):
+    global lstm_model
+    lstm_model = Sequential([
+        Embedding(vocab_size, 128, input_length=MAX_SEQUENCE_LENGTH),
+        LSTM(64, return_sequences=True),
+        LSTM(32),
+        Dense(16, activation='relu'),
+        Dense(1, activation='sigmoid')
+    ])
+    lstm_model.compile(optimizer='adam', loss='binary_crossentropy', metrics=['accuracy'])
+
+def prepare_lstm_input(code: str) -> np.ndarray:
+    tokens = tokenize_code(code)
+    sequences = tokenizer.texts_to_sequences([tokens])
+    return pad_sequences(sequences, maxlen=MAX_SEQUENCE_LENGTH)
+
+# Log interaction
+def log_interaction(request: Request, response: Dict[str, Any], input_data: Dict[str, Any]):
+    interaction = {
+        "timestamp": datetime.now().isoformat(),
+        "client_ip": request.client.host,
+        "input": input_data,
+        "response": response
+    }
+    try:
+        INTERACTION_LOG.parent.mkdir(parents=True, exist_ok=True)
+        if INTERACTION_LOG.exists():
+            with INTERACTION_LOG.open("r", encoding="utf-8") as f:
+                logs = json.load(f)
+        else:
+            logs = []
+        logs.append(interaction)
+        with INTERACTION_LOG.open("w", encoding="utf-8") as f:
+            json.dump(logs, f, indent=2)
+    except Exception as e:
+        logger.error(f"Failed to log interaction: {e}")
+
+# Train LSTM model
+async def train_lstm_model():
+    try:
+        if not INTERACTION_LOG.exists():
+            logger.info("No interaction log found for LSTM training")
+            return
+        with INTERACTION_LOG.open("r", encoding="utf-8") as f:
+            logs = json.load(f)
+        
+        codes = []
+        labels = []
+        for log in logs:
+            code = log["input"].get("code", "")
+            is_plagiarized = log["response"].get("result", {}).get("report", "").lower().find("ai-generated or plagiarized") != -1
+            codes.append(code)
+            labels.append(1 if is_plagiarized else 0)
+        
+        if len(codes) < 2:
+            logger.info("Insufficient data for LSTM training")
+            return
+        
+        tokenizer.fit_on_texts(codes)
+        X = pad_sequences(tokenizer.texts_to_sequences(codes), maxlen=MAX_SEQUENCE_LENGTH)
+        y = np.array(labels)
+        
+        init_lstm_model(len(tokenizer.word_index) + 1)
+        lstm_model.fit(X, y, epochs=5, batch_size=32, validation_split=0.2, verbose=0)
+        LSTM_MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
+        lstm_model.save(LSTM_MODEL_PATH)
+        logger.info("LSTM model trained and saved")
+    except Exception as e:
+        logger.error(f"Failed to train LSTM model: {e}")
+
+# IP ban management
+def is_ip_banned(ip: str) -> bool:
+    try:
+        BANNED_IPS.parent.mkdir(parents=True, exist_ok=True)
+        if BANNED_IPS.exists():
+            with BANNED_IPS.open("r", encoding="utf-8") as f:
+                return ip in {line.strip() for line in f}
+        return False
+    except Exception as e:
+        logger.error(f"Error checking banned IPs: {e}")
+        return False
+
+def ban_ip(ip: str):
+    try:
+        BANNED_IPS.parent.mkdir(parents=True, exist_ok=True)
+        with BANNED_IPS.open("a", encoding="utf-8") as f:
+            f.write(f"{ip}\n")
+        logger.info(f"Banned IP: {ip}")
+    except Exception as e:
+        logger.error(f"Failed to ban IP {ip}: {e}")
+
+# Authentication functions
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    return pwd_context.verify(plain_password, hashed_password)
+
+def get_password_hash(password: str) -> str:
+    return pwd_context.hash(password)
+
+def create_access_token(data: dict) -> str:
+    to_encode = data.copy()
+    expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    to_encode.update({"exp": expire})
+    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+
+async def get_current_user(token: str = Depends(oauth2_scheme)) -> Dict[str, Any]:
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        email: str = payload.get("sub")
+        if email is None or email not in users_db:
+            raise HTTPException(status_code=401, detail="Invalid authentication credentials")
+        return users_db[email]
+    except JWTError:
+        raise HTTPException(status_code=401, detail="Invalid authentication credentials")
+
+# AST-based comparison
+def parse_code_to_ast(code: str) -> Optional[clang.cindex.Cursor]:
+    try:
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.cpp', delete=False, encoding='utf-8') as temp_file:
+            temp_file.write(code)
+            temp_file_path = temp_file.name
+        index = clang.Index.create()
+        translation_unit = index.parse(temp_file_path, args=['-std=c++17'])
+        Path(temp_file_path).unlink()
+        if translation_unit.diagnostics:
+            for diag in translation_unit.diagnostics:
+                logger.warning(f"AST parsing diagnostic: {diag}")
+            return None
+        return translation_unit.cursor
+    except Exception as e:
+        logger.error(f"Failed to parse code to AST: {e}")
+        return None
+
+def serialize_ast(cursor: clang.cindex.Cursor, depth: int = 0) -> List[Dict[str, Any]]:
+    if not cursor:
+        return []
+    nodes = []
+    node = {
+        "kind": cursor.kind.name,
+        "children": []
+    }
+    for child in cursor.get_children():
+        node["children"].extend(serialize_ast(child, depth + 1))
+    nodes.append(node)
+    return nodes
+
+def compare_ast(ast1: List[Dict[str, Any]], ast2: List[Dict[str, Any]]) -> float:
+    if not ast1 or not ast2:
+        return 0.0
+    def ast_to_string(ast: List[Dict[str, Any]]) -> str:
+        result = []
+        for node in ast:
+            result.append(node["kind"])
+            result.extend(ast_to_string(node["children"]))
+        return "|".join(result)
+    
+    str1, str2 = ast_to_string(ast1), ast_to_string(ast2)
+    lcs_len = lcs_length(str1, str2)
+    return lcs_len / max(len(str1), len(str2)) if str1 and str2 else 0.0
+
+# Helper functions
 def check_openrouter_health(api_key: str, base_url: str = "https://openrouter.ai/api/v1") -> Tuple[bool, List[str]]:
     try:
-        if not api_key or not api_key.startswith("sk-or-v1-"):
-            logger.error("Invalid or missing API key for health check")
-            return False, []
-        masked_key = f"{api_key[:10]}...{api_key[-4:]}" if api_key else "None"
-        logger.debug(f"Health check using API key: {masked_key}")
         endpoint = f"{base_url.rstrip('/')}/models"
         headers = {"Authorization": f"Bearer {api_key}"}
         response = requests.get(endpoint, headers=headers, timeout=5)
@@ -136,122 +339,11 @@ def check_openrouter_health(api_key: str, base_url: str = "https://openrouter.ai
             model_ids = [model["id"] for model in data["data"]]
             logger.info("OpenRouter API health check passed")
             return True, model_ids
-        else:
-            logger.error("OpenRouter API response does not contain valid model list")
-            return False, []
-    except requests.exceptions.HTTPError as e:
-        logger.error(f"OpenRouter API health check failed: HTTP {e.response.status_code} - {str(e)}")
         return False, []
-    except requests.exceptions.RequestException as e:
+    except Exception as e:
         logger.error(f"OpenRouter API health check failed: {str(e)}")
         return False, []
-    except ValueError as e:
-        logger.error(f"OpenRouter API health check failed: Invalid JSON response - {str(e)}")
-        return False, []
 
-# Startup and shutdown events
-@app.on_event("startup")
-async def startup_event():
-    api_key = getenv("OPENROUTER_API_KEY")
-    base_url = "https://openrouter.ai/api/v1"
-    if not api_key or not api_key.startswith("sk-or-v1-"):
-        logger.error("OPENROUTER_API_KEY is missing or invalid")
-        raise RuntimeError("OPENROUTER_API_KEY is missing or invalid")
-    is_healthy, models = check_openrouter_health(api_key, base_url)
-    if not is_healthy:
-        logger.error("Startup failed: OpenRouter API unavailable")
-        raise RuntimeError("Startup failed: OpenRouter API unavailable")
-    app.state.available_models = models
-    logger.info(f"Available models: {models}")
-
-@app.on_event("shutdown")
-async def cleanup():
-    try:
-        if TEMP_MODEL_DIR.exists():
-            shutil.rmtree(TEMP_MODEL_DIR, ignore_errors=True)
-            logger.info(f"Cleaned up temporary directory {TEMP_MODEL_DIR}")
-        for file in [INPUT_1568, INPUT_1435, OUTPUT_1435]:
-            if file.exists():
-                file.unlink()
-                logger.info(f"Removed {file}")
-    except Exception as e:
-        logger.error(f"Failed to clean up: {str(e)}")
-
-# Query API function
-def query_api(messages: List[Dict[str, str]], model: str = None, temp: float = 0.7, max_tokens: int = 2000) -> str:
-    api_key = getenv("OPENROUTER_API_KEY")
-    if not api_key or not api_key.startswith("sk-or-v1-"):
-        logger.error("OPENROUTER_API_KEY is missing or invalid in query_api")
-        return ""
-    masked_key = f"{api_key[:10]}...{api_key[-4:]}" if api_key else "None"
-    logger.debug(f"Using API key: {masked_key} for query_api")
-    
-    if not model:
-        available_models = getattr(app.state, "available_models", [])
-        model = next((m for m in available_models if m == "moonshotai/kimi-k2:free"), "moonshotai/kimi-k2:free")
-        logger.debug(f"No model specified, using: {model}")
-    
-    fallback_models = ["qwen/qwen3-8b:free", "mistralai/mistral-7b-instruct:free"]
-    models_to_try = [model] + fallback_models
-    
-    for current_model in models_to_try:
-        try:
-            logger.debug(f"Sending API request to OpenRouter with model {current_model}")
-            response = client.chat.completions.create(
-                model=current_model,
-                messages=messages,
-                temperature=temp,
-                max_tokens=max_tokens,
-                response_format={"type": "json_object"}
-            )
-            content = response.choices[0].message.content.strip()
-            try:
-                parsed = json.loads(content)
-                code = parsed.get("code", "")
-                if not code:
-                    match = re.search(r"```cpp\n(.*?)```", content, re.DOTALL)
-                    if match:
-                        return match.group(1).strip()
-                    logger.error(f"No valid C++ code block found in API response")
-                    return content.strip()
-                return code.strip()
-            except json.JSONDecodeError:
-                match = re.search(r"```cpp\n(.*?)```", content, re.DOTALL)
-                if not match:
-                    logger.error(f"No valid C++ code block found in API response")
-                    return content.strip()
-                return match.group(1).strip()
-        except AuthenticationError as e:
-            logger.error(f"Authentication failed with model {current_model}: {str(e)}")
-            if current_model != models_to_try[-1]:
-                logger.warning(f"Retrying with next model")
-                continue
-            return ""
-        except RateLimitError as e:
-            if current_model != models_to_try[-1]:
-                delay = 60.0
-                logger.warning(f"Rate limit exceeded for model {current_model}: {str(e)}. Waiting {delay:.2f}s")
-                time.sleep(delay)
-                continue
-            logger.error(f"Rate limit exceeded for all models: {str(e)}")
-            return ""
-        except APIError as e:
-            if ("401" in str(e) or "404" in str(e) or "429" in str(e)) and current_model != models_to_try[-1]:
-                delay = 60.0 if "429" in str(e) or "404" in str(e) else 0
-                logger.warning(f"API error with model {current_model}: {str(e)}. Waiting {delay:.2f}s")
-                time.sleep(delay)
-                continue
-            logger.error(f"OpenRouter API error with model {current_model}: {str(e)}")
-            return ""
-        except Exception as e:
-            logger.error(f"Unexpected error in API query with model {current_model}: {str(e)}")
-            if current_model != models_to_try[-1]:
-                continue
-            return ""
-    logger.error(f"All models failed: {models_to_try}")
-    return ""
-
-# Code processing functions
 def clean_code(code: str, preserve_comments: bool = False) -> str:
     if not code:
         return ""
@@ -487,12 +579,50 @@ def compare_codes(code1: str, code2: str) -> Tuple[bool, str]:
         return False, "Empty code"
     cleaned1, cleaned2 = clean_code(code1), clean_code(code2)
     lcs_score = lcs_length(cleaned1, cleaned2)
-    lcs_ratio = lcs_score / min(len(cleaned1), len(cleaned2)) if cleaned1 and cleaned2 else 0
+    lcs_ratio = lcs_score / max(len(cleaned1), len(cleaned2)) if cleaned1 and cleaned2 else 0
     hash1, hash2 = compute_hash(code1), compute_hash(code2)
     common_hashes = len(set(hash1) & set(hash2))
-    hash_ratio = common_hashes / min(len(hash1), len(hash2)) if hash1 and hash2 else 0
-    is_similar = lcs_ratio >= CONFIG["lcs_threshold"] or hash_ratio >= CONFIG["hash_threshold"]
-    return is_similar, f"LCS: {lcs_ratio:.2f}, Hash: {hash_ratio:.2f}"
+    hash_ratio = common_hashes / max(len(hash1), len(hash2)) if hash1 and hash2 else 0
+    ast1 = parse_code_to_ast(code1)
+    ast2 = parse_code_to_ast(code2)
+    ast_similarity = compare_ast(serialize_ast(ast1), serialize_ast(ast2)) if ast1 and ast2 else 0.0
+    is_similar = lcs_ratio >= CONFIG["lcs_threshold"] or hash_ratio >= CONFIG["hash_threshold"] or ast_similarity >= CONFIG["ast_similarity_threshold"]
+    return is_similar, f"LCS: {lcs_ratio:.2f}, Hash: {hash_ratio:.2f}, AST: {ast_similarity:.2f}"
+
+def compare_with_previous_submission(current_code: str, handle: str) -> Tuple[bool, str]:
+    try:
+        INPUT_1435.parent.mkdir(parents=True, exist_ok=True)
+        if not INPUT_1435.exists():
+            return False, "No previous submissions"
+        
+        with INPUT_1435.open("r", encoding="utf-8") as f:
+            lines = f.readlines()
+        
+        previous_code = None
+        for i in range(len(lines) - 1, -1, -1):
+            if lines[i].startswith(f"xc9@{handle}"):
+                if i + 1 < len(lines) and not lines[i + 1].startswith("xc9@"):
+                    previous_code = lines[i + 1].strip()
+                break
+        
+        if not previous_code:
+            return False, "No previous submission found"
+        
+        cleaned_current = clean_code(current_code)
+        cleaned_previous = clean_code(previous_code)
+        lcs_score = lcs_length(cleaned_current, cleaned_previous)
+        lcs_ratio = lcs_score / max(len(cleaned_current), len(cleaned_previous)) if cleaned_current and cleaned_previous else 0
+        tokens1 = tokenize_code(cleaned_current)
+        tokens2 = tokenize_code(cleaned_previous)
+        structural_similarity = len(set(tokens1) & set(tokens2)) / max(len(tokens1), len(tokens2)) if tokens1 and tokens2 else 0
+        ast1 = parse_code_to_ast(current_code)
+        ast2 = parse_code_to_ast(previous_code)
+        ast_similarity = compare_ast(serialize_ast(ast1), serialize_ast(ast2)) if ast1 and ast2 else 0.0
+        is_suspicious = lcs_ratio >= CONFIG["similarity_threshold"] or structural_similarity >= CONFIG["similarity_threshold"] or ast_similarity >= CONFIG["ast_similarity_threshold"]
+        return is_suspicious, f"LCS: {lcs_ratio:.2f}, Structural: {structural_similarity:.2f}, AST: {ast_similarity:.2f}"
+    except Exception as e:
+        logger.error(f"Error comparing with previous submission: {e}")
+        return False, str(e)
 
 async def detect_plagiarism(code: str, handle: str) -> Tuple[bool, float, str, str, List[str]]:
     if not code:
@@ -511,9 +641,7 @@ async def detect_plagiarism(code: str, handle: str) -> Tuple[bool, float, str, s
             "content": (
                 "You are an expert C++ programmer. Generate C++ code that solves the same problem as described below. "
                 "Ensure the code is complete, syntactically correct, and uses modern C++ practices. "
-                "Wrap the generated code in a ```cpp code block, like this:\n"
-                "```cpp\n// Your code here\n```\n"
-                "Do not include explanations or comments outside the code block."
+                "Wrap the generated code in a ```cpp code block."
             )
         },
         {"role": "user", "content": intent}
@@ -527,18 +655,80 @@ async def detect_plagiarism(code: str, handle: str) -> Tuple[bool, float, str, s
     matrix2 = string_to_matrix(pad_string(generated_code))
     delta = abs(compute_global_distance(matrix1) - compute_global_distance(matrix2))
     lcs_score = lcs_length(cleaned_code, clean_code(generated_code))
-    lcs_ratio = lcs_score / min(len(cleaned_code), len(clean_code(generated_code))) if cleaned_code else 0
-    evidence = [f"Delta: {delta:.4f}", f"LCS: {lcs_ratio:.2f}"]
-    is_plagiarized = delta < CONFIG["plagiarism_threshold"] or lcs_ratio >= CONFIG["lcs_threshold"]
+    lcs_ratio = lcs_score / max(len(cleaned_code), len(clean_code(generated_code))) if cleaned_code else 0
+    ast1 = parse_code_to_ast(code)
+    ast2 = parse_code_to_ast(generated_code)
+    ast_similarity = compare_ast(serialize_ast(ast1), serialize_ast(ast2)) if ast1 and ast2 else 0.0
+    evidence = [f"Delta: {delta:.4f}", f"LCS: {lcs_ratio:.2f}", f"AST: {ast_similarity:.2f}"]
+    is_plagiarized = delta < CONFIG["plagiarism_threshold"] or lcs_ratio >= CONFIG["lcs_threshold"] or ast_similarity >= CONFIG["ast_similarity_threshold"]
     return is_plagiarized, delta, f"Delta: {delta:.4f}", "S" if is_plagiarized else "N", evidence
+
+def query_api(messages: List[Dict[str, str]], model: str = "moonshotai/kimi-k2:free", temp: float = 0.7, max_tokens: int = 2000) -> str:
+    fallback_models = ["qwen/qwen3-8b:free", "mistralai/mistral-7b-instruct:free"]
+    models_to_try = [model] + fallback_models
+    for current_model in models_to_try:
+        try:
+            response = client.chat.completions.create(
+                model=current_model,
+                messages=messages,
+                temperature=temp,
+                max_tokens=max_tokens
+            )
+            content = response.choices[0].message.content.strip()
+            try:
+                parsed = json.loads(content)
+                code = parsed.get("code", "")
+                if not code:
+                    match = re.search(r"```cpp\n(.*?)```", content, re.DOTALL)
+                    if match:
+                        return match.group(1).strip()
+                    logger.error(f"No valid C++ code block found in API response")
+                    return content.strip()
+                return code.strip()
+            except json.JSONDecodeError:
+                match = re.search(r"```cpp\n(.*?)```", content, re.DOTALL)
+                if match:
+                    return match.group(1).strip()
+                logger.error(f"No valid C++ code block found in API response")
+                return content.strip()
+        except AuthenticationError as e:
+            logger.error(f"Authentication failed with model {current_model}: {str(e)}")
+            if current_model != models_to_try[-1]:
+                continue
+            return ""
+        except RateLimitError as e:
+            if current_model != models_to_try[-1]:
+                delay = 60.0
+                logger.warning(f"Rate limit exceeded for model {current_model}. Waiting {delay:.2f}s")
+                time.sleep(delay)
+                continue
+            logger.error(f"Rate limit exceeded for all models: {str(e)}")
+            return ""
+        except APIError as e:
+            if ("401" in str(e) or "404" in str(e) or "429" in str(e)) and current_model != models_to_try[-1]:
+                delay = 60.0 if "429" in str(e) or "404" in str(e) else 0
+                logger.warning(f"API error with model {current_model}: {str(e)}. Waiting {delay:.2f}s")
+                time.sleep(delay)
+                continue
+            logger.error(f"OpenRouter API error with model {current_model}: {str(e)}")
+            return ""
+        except Exception as e:
+            logger.error(f"Unexpected error in API query with model {current_model}: {str(e)}")
+            if current_model != models_to_try[-1]:
+                continue
+            return ""
+    logger.error(f"All models failed: {models_to_try}")
+    return ""
 
 def process_code_submission(code: str, handle: str) -> None:
     try:
         cleaned_code = clean_code(code)
         if not cleaned_code:
             raise ValueError("Empty code after cleaning")
+        INPUT_1568.parent.mkdir(parents=True, exist_ok=True)
         with INPUT_1568.open("w", encoding="utf-8") as f:
             f.write(f"{cleaned_code}\nRqq7\n{handle}\n")
+        INPUT_1435.parent.mkdir(parents=True, exist_ok=True)
         with INPUT_1435.open("a+", encoding="utf-8") as f:
             f.seek(0)
             lines = f.readlines()
@@ -577,6 +767,7 @@ def detect_similar_codes(code: str, handle: str) -> List[str]:
             is_similar, details = compare_codes(cleaned_code, other_code)
             if is_similar:
                 similar_handles.append(f"{other_handle}: {details}")
+        OUTPUT_1435.parent.mkdir(parents=True, exist_ok=True)
         with OUTPUT_1435.open("w", encoding="utf-8") as f:
             if similar_handles:
                 f.write(f"{len(similar_handles)} similar pairs of codes detected\n\n")
@@ -623,18 +814,40 @@ def generate_report(analysis: Dict[str, Any], issues: List[str], handle: str,
         report += "- No further action required.\n"
     return report
 
+# Startup and shutdown events
+@app.on_event("startup")
+async def startup_event():
+    await FastAPILimiter.init(redis_client)
+    is_healthy, models = check_openrouter_health(api_key)
+    if not is_healthy:
+        logger.error("Startup failed: OpenRouter API unavailable")
+        raise RuntimeError("Startup failed: OpenRouter API unavailable")
+    app.state.available_models = models
+    if LSTM_MODEL_PATH.exists():
+        global lstm_model
+        lstm_model = tf.keras.models.load_model(LSTM_MODEL_PATH)
+        logger.info("Loaded existing LSTM model")
+    logger.info(f"Available models: {models}")
+
+@app.on_event("shutdown")
+async def cleanup():
+    try:
+        if TEMP_MODEL_DIR.exists():
+            shutil.rmtree(TEMP_MODEL_DIR, ignore_errors=True)
+            logger.info(f"Cleaned up temporary directory {TEMP_MODEL_DIR}")
+    except Exception as e:
+        logger.error(f"Failed to clean up: {str(e)}")
+
 # Endpoints
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
+    if is_ip_banned(request.client.host):
+        raise HTTPException(status_code=403, detail="IP address is banned")
     return templates.TemplateResponse("index.html", {"request": request})
 
 @app.get("/health", response_model=HealthResponse)
 async def health_check():
     try:
-        api_key = getenv("OPENROUTER_API_KEY")
-        if not api_key or not api_key.startswith("sk-or-v1-"):
-            logger.error("OPENROUTER_API_KEY is missing or invalid in health check")
-            return {"status": "unhealthy", "error": "Invalid or missing API key"}
         is_healthy, models = check_openrouter_health(api_key)
         if not is_healthy:
             return {"status": "unhealthy", "error": "OpenRouter API unavailable"}
@@ -643,26 +856,84 @@ async def health_check():
         logger.error(f"Health check failed: {str(e)}")
         return {"status": "unhealthy", "error": str(e)}
 
-@app.post("/analyze", response_class=HTMLResponse, responses={
-    200: {"content": {"text/html": {}}},
-    422: {"model": HTTPValidationError}
-})
-async def analyze_code(request: Request, code: str = Form(..., max_length=100_000), handle: str = Form("triumph")):
+@app.post("/register", response_class=HTMLResponse)
+async def register(request: Request, email1: str = Form(...), email2: str = Form(...), password: str = Form(...), handle: str = Form(...)):
     try:
+        user_data = UserRegister(email1=email1, email2=email2, password=password, handle=handle)
+        if email_usage.get(email1, 0) >= CONFIG["max_logins_per_email"] or email_usage.get(email2, 0) >= CONFIG["max_logins_per_email"]:
+            raise HTTPException(status_code=400, detail="Email usage limit exceeded")
+        
+        if email1 in users_db:
+            raise HTTPException(status_code=400, detail="Primary email already registered")
+        
+        hashed_password = get_password_hash(password)
+        users_db[email1] = {
+            "email1": email1,
+            "email2": email2,
+            "password": hashed_password,
+            "handle": handle
+        }
+        email_usage[email1] = email_usage.get(email1, 0) + 1
+        email_usage[email2] = email_usage.get(email2, 0) + 1
+        
+        return templates.TemplateResponse("index.html", {
+            "request": request,
+            "message": f"User {handle} registered successfully"
+        })
+    except Exception as e:
+        logger.error(f"Registration failed: {e}")
+        return templates.TemplateResponse("index.html", {
+            "request": request,
+            "error": f"Registration failed: {str(e)}"
+        })
+
+@app.post("/token", response_model=Token)
+async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends()):
+    user = users_db.get(form_data.username)
+    if not user or not verify_password(form_data.password, user["password"]):
+        raise HTTPException(status_code=401, detail="Incorrect email or password")
+    access_token = create_access_token(data={"sub": form_data.username})
+    return {"access_token": access_token, "token_type": "bearer"}
+
+@app.post("/analyze", response_class=HTMLResponse, dependencies=[Depends(RateLimiter(times=10, seconds=3600))])
+async def analyze_code(request: Request, code: str = Form(..., max_length=100_000), handle: str = Form(...), current_user: Dict[str, Any] = Depends(get_current_user)):
+    try:
+        if is_ip_banned(request.client.host):
+            raise HTTPException(status_code=403, detail="IP address is banned")
+        
         SingleCodeInput(code=code, handle=handle)
         health = await health_check()
         if health["status"] != "healthy":
-            return templates.TemplateResponse("index.html", {"request": request, "error": f"OpenRouter API unavailable: {health.get('error', 'Unknown error')}"})
+            raise HTTPException(status_code=503, detail=f"OpenRouter API unavailable: {health.get('error', 'Unknown error')}")
         
-        success, label, confidence, handle = classify_code(code, handle)  # Removed await
+        is_suspicious, similarity_details = compare_with_previous_submission(code, handle)
+        if is_suspicious:
+            ban_ip(request.client.host)
+            OUTPUT_1435.parent.mkdir(parents=True, exist_ok=True)
+            with OUTPUT_1435.open("a", encoding="utf-8") as f:
+                f.write(f"Cheater detected: {handle} - Suspicious similarity with previous submission: {similarity_details}\n")
+            raise HTTPException(status_code=403, detail="Suspicious code similarity detected. IP banned.")
+        
+        success, label, confidence, handle = classify_code(code, handle)
         if not success:
-            return templates.TemplateResponse("index.html", {"request": request, "error": label})
+            raise HTTPException(status_code=400, detail=label)
+        
         variables, has_long_vars = extract_variables(code)
         issues = [
             f"Variables longer than {CONFIG['var_length']} characters" if has_long_vars else "",
             "Suspicious comments" if has_suspicious_comments(code) else ""
         ]
+        ast = parse_code_to_ast(code)
+        if not ast:
+            issues.append("Failed to parse code to AST")
         issues = [x for x in issues if x]
+        
+        lstm_confidence = 0.0
+        if lstm_model:
+            lstm_input = prepare_lstm_input(code)
+            lstm_confidence = float(lstm_model.predict(lstm_input)[0][0])
+            if lstm_confidence > 0.8:
+                issues.append(f"LSTM model indicates AI-generated code (confidence: {lstm_confidence:.2%})")
         
         is_plagiarized, delta, delta_details, sim_status, evidence = await detect_plagiarism(code, handle)
         model1_result = ("S" if is_plagiarized else "N", [delta_details])
@@ -673,28 +944,43 @@ async def analyze_code(request: Request, code: str = Form(..., max_length=100_00
         analysis = {"label": label, "confidence": confidence, "similar_handles": similar_handles}
         report = generate_report(analysis, issues, handle, model1_result, model2_result)
         
+        OUTPUT_1435.parent.mkdir(parents=True, exist_ok=True)
         with OUTPUT_1435.open("a+", encoding="utf-8") as f:
             f.write(f"Handle: {handle} ({label}-generated)\n")
             f.write(f"Confidence: {confidence:.2%}\n")
+            f.write(f"LSTM Confidence: {lstm_confidence:.2%}\n")
             f.write(f"Plagiarism: {'Detected' if is_plagiarized else 'Not detected'}\n")
             f.write("\n".join(evidence) + "\n\n")
         
+        response_data = {
+            "result": {"handle": handle, "report": report, "confidence": confidence, "label": label, "lstm_confidence": lstm_confidence}
+        }
+        log_interaction(request, response_data, {"code": code, "handle": handle})
+        
+        await train_lstm_model()
+        
         return templates.TemplateResponse("index.html", {
             "request": request,
-            "result": {"handle": handle, "report": report, "confidence": confidence, "label": label}
+            "result": response_data["result"]
         })
     except Exception as e:
         logger.error(f"Analyze code failed: {str(e)}")
-        return templates.TemplateResponse("index.html", {"request": request, "error": f"Analyze code failed: {str(e)}"})
+        log_interaction(request, {"error": str(e)}, {"code": code, "handle": handle})
+        raise HTTPException(status_code=500, detail=f"Analyze code failed: {str(e)}")
 
-@app.post("/prepare", response_class=HTMLResponse)
-async def prepare_submission(request: Request, code: str = Form(...), handle: str = Form(...)):
+@app.post("/prepare", response_class=HTMLResponse, dependencies=[Depends(RateLimiter(times=10, seconds=3600))])
+async def prepare_submission(request: Request, code: str = Form(...), handle: str = Form(...), current_user: Dict[str, Any] = Depends(get_current_user)):
     try:
+        if is_ip_banned(request.client.host):
+            raise HTTPException(status_code=403, detail="IP address is banned")
         SingleCodeInput(code=code, handle=handle)
         process_code_submission(code, handle)
+        response_data = {"message": f"Code for {handle} prepared"}
+        log_interaction(request, response_data, {"code": code, "handle": handle})
         return templates.TemplateResponse("index.html", {"request": request, "message": f"Code for {handle} prepared"})
     except Exception as e:
         logger.error(f"Prepare submission failed: {e}")
+        log_interaction(request, {"error": str(e)}, {"code": code, "handle": handle})
         return templates.TemplateResponse("index.html", {"request": request, "error": f"Prepare submission failed: {str(e)}"})
 
 if __name__ == "__main__":
