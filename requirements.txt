@@ -16,3 +16,4 @@ pyjwt==2.9.0
 passlib[bcrypt]==1.7.4
 tensorflow==2.17.0
 clang==18.1.8
+jose
