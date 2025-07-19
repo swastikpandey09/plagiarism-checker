@@ -30,20 +30,35 @@ from tensorflow.keras.preprocessing.text import Tokenizer
 from tensorflow.keras.preprocessing.sequence import pad_sequences
 import clang.cindex as clang
 
-# Logging setup
-logging.basicConfig(level=logging.INFO, format="%(levelname)s | %(asctime)s | %(message)s")
+# Logging setup with JSON formatter for better Railway debugging
+class JSONFormatter(logging.Formatter):
+    def format(self, record):
+        log_data = {
+            "level": record.levelname,
+            "timestamp": datetime.now().isoformat(),
+            "message": record.getMessage(),
+            "module": record.module,
+            "funcName": record.funcName,
+            "lineno": record.lineno
+        }
+        return json.dumps(log_data)
+
 logger = logging.getLogger(__name__)
+handler = logging.StreamHandler()
+handler.setFormatter(JSONFormatter())
+logger.handlers = [handler]
+logging.basicConfig(level=logging.INFO)
 
 # Load environment variables
 load_dotenv()
 OPENROUTER_API_KEY = getenv("OPENROUTER_API_KEY")
 SECRET_KEY = getenv("SECRET_KEY")
 if not OPENROUTER_API_KEY or not SECRET_KEY:
-    logger.error("Missing required environment variables")
+    logger.error("Missing required environment variables: OPENROUTER_API_KEY or SECRET_KEY")
     raise RuntimeError("OPENROUTER_API_KEY or SECRET_KEY is missing")
 
 # FastAPI app setup
-app = FastAPI(title="Code Plagiarism Detector", version="0.2.1")
+app = FastAPI(title="Code Plagiarism Detector", version="0.2.2")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -471,6 +486,9 @@ def generate_report(analysis: Dict[str, Any], plagiarism: Dict[str, Any], handle
 async def startup_event():
     logger.info("Starting application...")
     try:
+        # Verify pyjwt import
+        from jose import jwt
+        logger.info("pyjwt module loaded successfully")
         if LSTM_MODEL_PATH.exists():
             global lstm_model
             lstm_model = tf.keras.models.load_model(LSTM_MODEL_PATH)
