@@ -59,7 +59,7 @@ if not OPENROUTER_API_KEY or not SECRET_KEY:
     raise RuntimeError("OPENROUTER_API_KEY or SECRET_KEY missing")
 
 # FastAPI app setup
-app = FastAPI(title="Code Plagiarism Detector", version="0.2.2")
+app = FastAPI(title="Code Plagiarism Detector", version="0.2.3")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -129,11 +129,18 @@ class UserRegister(BaseModel):
 class CodeInput(BaseModel):
     code: str
     handle: str
+    language: str
 
     @field_validator("handle")
     def validate_handle(cls, v):
         if not v.strip() or any(c in v for c in "\n$"):
             raise ValueError("Invalid handle")
+        return v
+
+    @field_validator("language")
+    def validate_language(cls, v):
+        if v not in ["cpp", "python"]:
+            raise ValueError("Language must be 'cpp' or 'python'")
         return v
 
 class Token(BaseModel):
@@ -449,7 +456,7 @@ def calculate_plagiarism_score(text1: str, text2: str) -> Dict[str, float]:
         "combined_score": combined_score
     }
 
-def compare_with_previous_submission(code: str, handle: str) -> Dict[str, Any]:
+def compare_with_previous_submission(code: str, handle: str, language: str) -> Dict[str, Any]:
     try:
         if not INPUT_1435.exists():
             return {"is_suspicious": False, "details": "No previous submissions"}
@@ -463,42 +470,46 @@ def compare_with_previous_submission(code: str, handle: str) -> Dict[str, Any]:
                 break
         if not previous_code:
             return {"is_suspicious": False, "details": "No previous submission found"}
-        cleaned_current =-clean_code(code)
+        cleaned_current = clean_code(code)
         cleaned_previous = clean_code(previous_code)
         lcs_score = lcs_length(cleaned_current, cleaned_previous)
-        lcs_ratio = lcs_score / max(cleaned_current, cleaned_previous) if cleaned_current and cleaned_previous else 0
-        ast_sim = cpp_ast_similarity(code, previous_code)
+        lcs_ratio = lcs_score / max(len(cleaned_current), len(cleaned_previous)) if cleaned_current and cleaned_previous else 0
+        ast_sim = cpp_ast_similarity(code, previous_code) if language == "cpp" else python_ast_similarity(code, previous_code)
         is_suspicious = lcs_ratio >= CONFIG["similarity_threshold"] or ast_sim >= CONFIG["ast_similarity_threshold"]
         return {"is_suspicious": is_suspicious, "details": f"LCS: {lcs_ratio:.2f}, AST: {ast_sim:.2f}"}
     except Exception as e:
         logger.error(f"Error comparing with previous submission: {e}")
         return {"is_suspicious": False, "details": str(e)}
 
-async def detect_plagiarism(code: str, handle: str) -> Dict[str, Any]:
+async def detect_plagiarism(code: str, handle: str, language: str) -> Dict[str, Any]:
     if not code:
         return {"is_plagiarized": False, "delta": 0.0, "details": "Empty code", "status": "N", "evidence": ["Empty code"]}
     cleaned_code = clean_code(code)
     intent_prompt = [
-        {"role": "system", "content": "Describe the purpose of the following C++ code concisely."},
-        {"role": "user", "content": f"```cpp\n{code}\n```"}
+        {"role": "system", "content": f"Describe the purpose of the following {language.upper()} code concisely."},
+        {"role": "user", "content": f"```{language}\n{code}\n```"}
     ]
     intent = await query_api(intent_prompt)
     if not intent:
         return {"is_plagiarized": False, "delta": 0.0, "details": "Failed to get intent", "status": "N", "evidence": ["Failed to get intent"]}
     generate_prompt = [
-        {"role": "system", "content": "Generate C++ code solving the described problem using modern C++ practices."},
+        {"role": "system", "content": f"Generate {language.upper()} code solving the described problem using modern {language.upper()} practices."},
         {"role": "user", "content": intent}
     ]
     generated_code = await query_api(generate_prompt)
-    match = re.search(r"```cpp\n(.*?)```", generated_code, re.DOTALL)
+    match = re.search(rf"```{language}\n(.*?)```", generated_code, re.DOTALL)
     generated_code = match.group(1).strip() if match else generated_code.strip()
     if not generated_code:
         return {"is_plagiarized": False, "delta": 0.0, "details": "No generated code", "status": "N", "evidence": ["No generated code"]}
     lcs_score = lcs_length(cleaned_code, clean_code(generated_code))
     lcs_ratio = lcs_score / max(len(cleaned_code), len(clean_code(generated_code))) if cleaned_code else 0
-    ast_sim = cpp_ast_similarity(code, generated_code)
+    ast_sim = cpp_ast_similarity(code, generated_code) if language == "cpp" else python_ast_similarity(code, generated_code)
     is_plagiarized = lcs_ratio >= CONFIG["lcs_threshold"] or ast_sim >= CONFIG["ast_similarity_threshold"]
     evidence = [f"LCS: {lcs_ratio:.2f}", f"AST: {ast_sim:.2f}"]
+    if language == "python":
+        reference_score = calculate_plagiarism_score(code, INPUT_1568.read_text() if INPUT_1568.exists() else "")
+        evidence.append(f"Reference Similarity: {reference_score['combined_score']:.2f}")
+        is_plagiarized = is_plagiarized or reference_score["combined_score"] > CONFIG["plagiarism_threshold"]
     return {
         "is_plagiarized": is_plagiarized,
         "delta": lcs_ratio,
@@ -516,8 +527,7 @@ async def query_api(messages: List[Dict[str, str]], model: str = "moonshotai/kim
             max_tokens=2000
         )
         content = response.choices[0].message.content.strip()
-        match = re.search(r"```cpp\n(.*?)```", content, re.DOTALL)
-        return match.group(1).strip() if match else content.strip()
+        return content
     except APIError as e:
         logger.error(f"OpenRouter API error: {e}")
         return ""
@@ -545,7 +555,7 @@ def process_code_submission(code: str, handle: str):
         logger.error(f"Failed to process submission: {e}")
         raise
 
-def detect_similar_codes(code: str, handle: str) -> List[str]:
+def detect_similar_codes(code: str, handle: str, language: str) -> List[str]:
     try:
         if not INPUT_1435.exists():
             return []
@@ -564,7 +574,7 @@ def detect_similar_codes(code: str, handle: str) -> List[str]:
             if other_handle != handle:
                 lcs_score = lcs_length(cleaned_code, clean_code(other_code))
                 lcs_ratio = lcs_score / max(len(cleaned_code), len(clean_code(other_code))) if cleaned_code else 0
-                ast_sim = cpp_ast_similarity(cleaned_code, other_code)
+                ast_sim = cpp_ast_similarity(cleaned_code, other_code) if language == "cpp" else python_ast_similarity(cleaned_code, other_code)
                 if lcs_ratio >= CONFIG["lcs_threshold"] or ast_sim >= CONFIG["ast_similarity_threshold"]:
                     similar_handles.append(f"{other_handle}: LCS: {lcs_ratio:.2f}, AST: {ast_sim:.2f}")
         OUTPUT_1435.parent.mkdir(parents=True, exist_ok=True)
@@ -668,12 +678,12 @@ async def login(form_data: OAuth2PasswordRequestForm = Depends()):
     return {"access_token": access_token, "token_type": "bearer"}
 
 @app.post("/analyze", response_class=HTMLResponse)
-async def analyze_code(request: Request, code: str = Form(..., max_length=100_000), handle: str = Form(...), current_user: Dict[str, Any] = Depends(get_current_user)):
+async def analyze_code(request: Request, code: str = Form(..., max_length=100_000), handle: str = Form(...), language: str = Form(...), current_user: Dict[str, Any] = Depends(get_current_user)):
     try:
         if is_ip_banned(request.client.host):
             raise HTTPException(status_code=403, detail="IP banned")
-        CodeInput(code=code, handle=handle)
-        prev_result = compare_with_previous_submission(code, handle)
+        CodeInput(code=code, handle=handle, language=language)
+        prev_result = compare_with_previous_submission(code, handle, language)
         if prev_result["is_suspicious"]:
             ban_ip(request.client.host)
             with OUTPUT_1435.open("a", encoding="utf-8") as f:
@@ -682,17 +692,17 @@ async def analyze_code(request: Request, code: str = Form(..., max_length=100_00
         analysis = classify_code(code, handle)
         if not analysis["success"]:
             raise HTTPException(status_code=400, detail=analysis["label"])
-        plagiarism = await detect_plagiarism(code, handle)
-        similar_handles = detect_similar_codes(code, handle)
+        plagiarism = await detect_plagiarism(code, handle, language)
+        similar_handles = detect_similar_codes(code, handle, language)
         analysis["similar_handles"] = similar_handles
         report = generate_report(analysis, plagiarism, handle)
         process_code_submission(code, handle)
         response_data = {"result": {"handle": handle, "report": report, "confidence": analysis["confidence"], "label": analysis["label"]}}
-        log_interaction(request, response_data, {"code": code, "handle": handle})
+        log_interaction(request, response_data, {"code": code, "handle": handle, "language": language})
         await train_lstm_model()
         return templates.TemplateResponse("index.html", {"request": request, "result": response_data["result"]})
     except Exception as e:
-        log_interaction(request, {"error": str(e)}, {"code": code, "handle": handle})
+        log_interaction(request, {"error": str(e)}, {"code": code, "handle": handle, "language": language})
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/check_plagiarism")
@@ -705,10 +715,8 @@ async def check_plagiarism(code_input: CodeInput, current_user: Dict[str, Any] =
         email_usage[email]["count"] += 1
         if email_usage[email]["count"] > CONFIG["max_logins_per_email"]:
             raise HTTPException(status_code=429, detail="Too many requests for this email")
-        with open(INPUT_1568, "r", encoding="utf-8") as f:
-            reference_text_1568 = f.read()
-        with open(INPUT_1435, "r", encoding="utf-8") as f:
-            reference_text_1435 = f.read()
+        reference_text_1568 = INPUT_1568.read_text(encoding="utf-8") if INPUT_1568.exists() else ""
+        reference_text_1435 = INPUT_1435.read_text(encoding="utf-8") if INPUT_1435.exists() else ""
         score_1568 = calculate_plagiarism_score(code_input.code, reference_text_1568)
         score_1435 = calculate_plagiarism_score(code_input.code, reference_text_1435)
         log_entry = {
@@ -753,7 +761,7 @@ async def prepare_submission(request: Request, code: str = Form(...), handle: st
     try:
         if is_ip_banned(request.client.host):
             raise HTTPException(status_code=403, detail="IP banned")
-        CodeInput(code=code, handle=handle)
+        CodeInput(code=code, handle=handle, language="cpp")  # Default to cpp for prepare
         process_code_submission(code, handle)
         response_data = {"message": f"Code for {handle} prepared"}
         log_interaction(request, response_data, {"code": code, "handle": handle})
