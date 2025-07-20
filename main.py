@@ -10,13 +10,13 @@ from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, EmailStr, validator
+from pydantic import BaseModel, EmailStr, field_validator
 from py7zr import SevenZipFile
 import tempfile
 import shutil
 from os import environ, getenv
+from dotenv import load_dotenv
 from openai import OpenAI, APIError
-import requests
 from datetime import datetime, timedelta
 from collections import Counter
 import math
@@ -29,8 +29,9 @@ from tensorflow.keras.layers import LSTM, Dense, Embedding
 from tensorflow.keras.preprocessing.text import Tokenizer
 from tensorflow.keras.preprocessing.sequence import pad_sequences
 import clang.cindex as clang
+import ast
 
-# Logging setup with JSON formatter for better Railway debugging
+# Logging setup with JSON formatter
 class JSONFormatter(logging.Formatter):
     def format(self, record):
         log_data = {
@@ -54,8 +55,8 @@ load_dotenv()
 OPENROUTER_API_KEY = getenv("OPENROUTER_API_KEY")
 SECRET_KEY = getenv("SECRET_KEY")
 if not OPENROUTER_API_KEY or not SECRET_KEY:
-    logger.error("Missing required environment variables: OPENROUTER_API_KEY or SECRET_KEY")
-    raise RuntimeError("OPENROUTER_API_KEY or SECRET_KEY is missing")
+    logger.error("Missing required environment variables")
+    raise RuntimeError("OPENROUTER_API_KEY or SECRET_KEY missing")
 
 # FastAPI app setup
 app = FastAPI(title="Code Plagiarism Detector", version="0.2.2")
@@ -92,11 +93,15 @@ CONFIG = {
     "max_logins_per_email": 2,
 }
 
-# Token frequencies
+# Token frequencies for C++
 HUMAN_FREQUENCIES = {
     'int': 7.22, 'if': 3.72, 'for': 2.93, 'cin': 1.81, 'cout': 1.22, '#include': 1.01,
     '<iostream>': 1.01, 'namespace': 1.0, 'std': 1.0, 'return': 1.35, 'while': 1.5,
     '>>': 1.2, '<<': 1.2, 'endl': 1.0, 'main': 1.0, '+': 1.0, ' ': 50.0,
+    '}': 1.2, '{': 1.2, '<': 1.0, '>': 1.0, '-': 1.0, '*': 1.0, '/': 1.0,
+    '=': 1.0, '==': 1.0, '!=': 1.0, '<=': 1.0, '>=': 1.0, '&&': 1.0, '||': 1.0,
+    '!': 1.0, '&': 1.0, '|': 1.0, '^': 1.0, '~': 1.0, '(': 50.0, ')': 50.0,
+    '[': 1.0, ']': 1.0, ';': 50.0, ',': 1.0, '.': 1.0, '"': 1.0, '\n': 50.0, '\t': 50.0
 }
 
 # OpenAI client
@@ -108,12 +113,14 @@ class UserRegister(BaseModel):
     email2: EmailStr
     password: str
     handle: str
-    @validator("handle")
+
+    @field_validator("handle")
     def validate_handle(cls, v):
         if not v.strip() or any(c in v for c in "\n$"):
             raise ValueError("Invalid handle")
         return v
-    @validator("email2")
+
+    @field_validator("email2")
     def emails_different(cls, v, values):
         if "email1" in values and v == values["email1"]:
             raise ValueError("Emails must be different")
@@ -122,7 +129,8 @@ class UserRegister(BaseModel):
 class CodeInput(BaseModel):
     code: str
     handle: str
-    @validator("handle")
+
+    @field_validator("handle")
     def validate_handle(cls, v):
         if not v.strip() or any(c in v for c in "\n$"):
             raise ValueError("Invalid handle")
@@ -134,10 +142,14 @@ class Token(BaseModel):
 
 # Global state
 users_db: Dict[str, Dict[str, Any]] = {}
-email_usage: Dict[str, int] = {}
+email_usage: Dict[str, Dict[str, Any]] = {}
 tokenizer = Tokenizer()
 lstm_model = None
 MAX_SEQUENCE_LENGTH = 1000
+
+# Initialize tokenizer with dummy data if empty
+if not tokenizer.word_index:
+    tokenizer.fit_on_texts(["def main():\n    print(\"Hello World\")", "import os\nimport sys"])
 
 def init_lstm_model(vocab_size: int = 10000):
     global lstm_model
@@ -150,20 +162,28 @@ def init_lstm_model(vocab_size: int = 10000):
     ])
     lstm_model.compile(optimizer='adam', loss='binary_crossentropy', metrics=['accuracy'])
 
-def log_interaction(request: Request, response: Dict[str, Any], input_data: Dict[str, Any]):
-    interaction = {
-        "timestamp": datetime.now().isoformat(),
-        "client_ip": request.client.host,
-        "input": input_data,
-        "response": response
-    }
-    try:
-        INTERACTION_LOG.parent.mkdir(parents=True, exist_ok=True)
-        logs = json.load(INTERACTION_LOG.open("r", encoding="utf-8")) if INTERACTION_LOG.exists() else []
-        logs.append(interaction)
-        INTERACTION_LOG.open("w", encoding="utf-8").write(json.dumps(logs, indent=2))
-    except Exception as e:
-        logger.error(f"Failed to log interaction: {e}")
+def load_lstm_model():
+    global lstm_model
+    if lstm_model is None:
+        try:
+            lstm_model = tf.keras.models.load_model(LSTM_MODEL_PATH)
+            logger.info("LSTM model loaded successfully")
+        except Exception as e:
+            logger.error(f"Error loading LSTM model: {e}")
+            init_lstm_model()
+            logger.warning("Initialized new LSTM model")
+
+def preprocess_text_for_lstm(text: str) -> np.ndarray:
+    sequences = tokenizer.texts_to_sequences([text])
+    padded_sequences = pad_sequences(sequences, maxlen=MAX_SEQUENCE_LENGTH)
+    return padded_sequences
+
+def predict_plagiarism_lstm(text: str) -> float:
+    if lstm_model is None:
+        load_lstm_model()
+    processed_text = preprocess_text_for_lstm(text)
+    prediction = lstm_model.predict(processed_text, verbose=0)[0][0]
+    return float(prediction)
 
 async def train_lstm_model():
     try:
@@ -215,9 +235,9 @@ def verify_password(plain_password: str, hashed_password: str) -> bool:
 def get_password_hash(password: str) -> str:
     return pwd_context.hash(password)
 
-def create_access_token(data: dict) -> str:
+def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
     to_encode = data.copy()
-    expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    expire = datetime.utcnow() + (expires_delta or timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
     to_encode.update({"exp": expire})
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
@@ -230,43 +250,6 @@ async def get_current_user(token: str = Depends(oauth2_scheme)) -> Dict[str, Any
         return users_db[email]
     except JWTError:
         raise HTTPException(status_code=401, detail="Invalid credentials")
-
-def parse_code_to_ast(code: str) -> Optional[clang.cindex.Cursor]:
-    try:
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.cpp', delete=False, encoding='utf-8') as temp_file:
-            temp_file.write(code)
-            temp_file_path = temp_file.name
-        index = clang.Index.create()
-        tu = index.parse(temp_file_path, args=['-std=c++17'])
-        Path(temp_file_path).unlink()
-        if tu.diagnostics:
-            logger.warning(f"AST parsing issues: {[diag for diag in tu.diagnostics]}")
-            return None
-        return tu.cursor
-    except Exception as e:
-        logger.error(f"AST parsing failed: {e}")
-        return None
-
-def serialize_ast(cursor: clang.cindex.Cursor) -> List[Dict[str, Any]]:
-    if not cursor:
-        return []
-    nodes = [{"kind": cursor.kind.name, "children": []}]
-    for child in cursor.get_children():
-        nodes[0]["children"].extend(serialize_ast(child))
-    return nodes
-
-def compare_ast(ast1: List[Dict[str, Any]], ast2: List[Dict[str, Any]]) -> float:
-    if not ast1 or not ast2:
-        return 0.0
-    def ast_to_string(ast: List[Dict[str, Any]]) -> str:
-        result = []
-        for node in ast:
-            result.append(node["kind"])
-            result.extend(ast_to_string(node["children"]))
-        return "|".join(result)
-    str1, str2 = ast_to_string(ast1), ast_to_string(ast2)
-    lcs_len = lcs_length(str1, str2)
-    return lcs_len / max(len(str1), len(str2)) if str1 and str2 else 0.0
 
 def clean_code(code: str) -> str:
     if not code:
@@ -325,17 +308,146 @@ def lcs_length(str1: str, str2: str) -> int:
             dp[i][j] = dp[i-1][j-1] + 1 if str1[i-1] == str2[j-1] else max(dp[i-1][j], dp[i][j-1])
     return dp[n][m]
 
-def compare_codes(code1: str, code2: str) -> Dict[str, Any]:
-    if not code1 or not code2:
-        return {"is_similar": False, "details": "Empty code"}
-    cleaned1, cleaned2 = clean_code(code1), clean_code(code2)
-    lcs_score = lcs_length(cleaned1, cleaned2)
-    lcs_ratio = lcs_score / max(len(cleaned1), cleaned2) if cleaned1 and cleaned2 else 0
+def lcs_similarity(s1: str, s2: str) -> float:
+    m, n = len(s1), len(s2)
+    dp = [[0] * (n + 1) for _ in range(m + 1)]
+    for i in range(1, m + 1):
+        for j in range(1, n + 1):
+            if s1[i - 1] == s2[j - 1]:
+                dp[i][j] = 1 + dp[i - 1][j - 1]
+            else:
+                dp[i][j] = max(dp[i - 1][j], dp[i][j - 1])
+    lcs_length = dp[m][n]
+    return lcs_length / max(m, n) if max(m, n) > 0 else 0.0
+
+def jaccard_similarity(s1: str, s2: str) -> float:
+    set1 = set(s1.split())
+    set2 = set(s2.split())
+    intersection = len(set1.intersection(set2))
+    union = len(set1.union(set2))
+    return intersection / union if union > 0 else 0.0
+
+def cosine_similarity(text1: str, text2: str) -> float:
+    words1 = Counter(text1.lower().split())
+    words2 = Counter(text2.lower().split())
+    all_words = list(set(words1.keys()) | set(words2.keys()))
+    vec1 = [words1[word] for word in all_words]
+    vec2 = [words2[word] for word in all_words]
+    dot_product = sum(v1 * v2 for v1, v2 in zip(vec1, vec2))
+    magnitude1 = math.sqrt(sum(v1**2 for v1 in vec1))
+    magnitude2 = math.sqrt(sum(v2**2 for v2 in vec2))
+    if not magnitude1 or not magnitude2:
+        return 0.0
+    return dot_product / (magnitude1 * magnitude2)
+
+def winnowing_hash_similarity(text1: str, text2: str, k: int = 5, w: int = 10) -> float:
+    def get_ngrams(text, n):
+        return [text[i:i+n] for i in range(len(text) - n + 1)]
+
+    def get_hashes(ngrams):
+        return [hash(ngram) for ngram in ngrams]
+
+    def get_fingerprints(hashes, window_size):
+        fingerprints = set()
+        if len(hashes) < window_size:
+            return set(hashes)
+        for i in range(len(hashes) - window_size + 1):
+            window = hashes[i : i + window_size]
+            min_hash = min(window)
+            fingerprints.add(min_hash)
+        return fingerprints
+
+    ngrams1 = get_ngrams(text1, k)
+    ngrams2 = get_ngrams(text2, k)
+    hashes1 = get_hashes(ngrams1)
+    hashes2 = get_hashes(ngrams2)
+    fingerprints1 = get_fingerprints(hashes1, w)
+    fingerprints2 = get_fingerprints(hashes2, w)
+
+    intersection = len(fingerprints1.intersection(fingerprints2))
+    union = len(fingerprints1.union(fingerprints2))
+    return intersection / union if union > 0 else 0.0
+
+def cpp_ast_similarity(code1: str, code2: str) -> float:
+    def parse_code_to_ast(code: str) -> Optional[clang.cindex.Cursor]:
+        try:
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.cpp', delete=False, encoding='utf-8') as temp_file:
+                temp_file.write(code)
+                temp_file_path = temp_file.name
+            index = clang.Index.create()
+            tu = index.parse(temp_file_path, args=['-std=c++17'])
+            Path(temp_file_path).unlink()
+            if tu.diagnostics:
+                logger.warning(f"AST parsing issues: {[diag for diag in tu.diagnostics]}")
+                return None
+            return tu.cursor
+        except Exception as e:
+            logger.error(f"AST parsing failed: {e}")
+            return None
+
+    def serialize_ast(cursor: clang.cindex.Cursor) -> List[Dict[str, Any]]:
+        if not cursor:
+            return []
+        nodes = [{"kind": cursor.kind.name, "children": []}]
+        for child in cursor.get_children():
+            nodes[0]["children"].extend(serialize_ast(child))
+        return nodes
+
     ast1 = parse_code_to_ast(code1)
     ast2 = parse_code_to_ast(code2)
-    ast_similarity = compare_ast(serialize_ast(ast1), serialize_ast(ast2)) if ast1 and ast2 else 0.0
-    is_similar = lcs_ratio >= CONFIG["lcs_threshold"] or ast_similarity >= CONFIG["ast_similarity_threshold"]
-    return {"is_similar": is_similar, "details": f"LCS: {lcs_ratio:.2f}, AST: {ast_similarity:.2f}"}
+    if not ast1 or not ast2:
+        return 0.0
+    def ast_to_string(ast: List[Dict[str, Any]]) -> str:
+        result = []
+        for node in ast:
+            result.append(node["kind"])
+            result.extend(ast_to_string(node["children"]))
+        return "|".join(result)
+    str1, str2 = ast_to_string(serialize_ast(ast1)), ast_to_string(serialize_ast(ast2))
+    lcs_len = lcs_length(str1, str2)
+    return lcs_len / max(len(str1), len(str2)) if str1 and str2 else 0.0
+
+def python_ast_similarity(code1: str, code2: str) -> float:
+    try:
+        tree1 = ast.parse(code1)
+        tree2 = ast.parse(code2)
+    except SyntaxError:
+        return 0.0
+    def get_nodes(tree):
+        nodes = []
+        for node in ast.walk(tree):
+            nodes.append(type(node))
+        return nodes
+    nodes1 = get_nodes(tree1)
+    nodes2 = get_nodes(tree2)
+    common_nodes = len(set(nodes1).intersection(set(nodes2)))
+    total_nodes = len(set(nodes1).union(set(nodes2)))
+    return common_nodes / total_nodes if total_nodes > 0 else 0.0
+
+def calculate_plagiarism_score(text1: str, text2: str) -> Dict[str, float]:
+    lcs = lcs_similarity(text1, text2)
+    jaccard = jaccard_similarity(text1, text2)
+    cosine = cosine_similarity(text1, text2)
+    winnowing = winnowing_hash_similarity(text1, text2)
+    ast_sim = python_ast_similarity(text1, text2)
+    lstm_pred = predict_plagiarism_lstm(text1)
+    combined_score = (
+        lcs * 0.2 +
+        jaccard * 0.15 +
+        cosine * 0.15 +
+        winnowing * 0.2 +
+        ast_sim * 0.15 +
+        lstm_pred * 0.15
+    )
+    return {
+        "lcs_similarity": lcs,
+        "jaccard_similarity": jaccard,
+        "cosine_similarity": cosine,
+        "winnowing_hash_similarity": winnowing,
+        "ast_similarity": ast_sim,
+        "lstm_prediction": lstm_pred,
+        "combined_score": combined_score
+    }
 
 def compare_with_previous_submission(code: str, handle: str) -> Dict[str, Any]:
     try:
@@ -355,11 +467,9 @@ def compare_with_previous_submission(code: str, handle: str) -> Dict[str, Any]:
         cleaned_previous = clean_code(previous_code)
         lcs_score = lcs_length(cleaned_current, cleaned_previous)
         lcs_ratio = lcs_score / max(len(cleaned_current), len(cleaned_previous)) if cleaned_current and cleaned_previous else 0
-        ast1 = parse_code_to_ast(code)
-        ast2 = parse_code_to_ast(previous_code)
-        ast_similarity = compare_ast(serialize_ast(ast1), serialize_ast(ast2)) if ast1 and ast2 else 0.0
-        is_suspicious = lcs_ratio >= CONFIG["similarity_threshold"] or ast_similarity >= CONFIG["ast_similarity_threshold"]
-        return {"is_suspicious": is_suspicious, "details": f"LCS: {lcs_ratio:.2f}, AST: {ast_similarity:.2f}"}
+        ast_sim = cpp_ast_similarity(code, previous_code)
+        is_suspicious = lcs_ratio >= CONFIG["similarity_threshold"] or ast_sim >= CONFIG["ast_similarity_threshold"]
+        return {"is_suspicious": is_suspicious, "details": f"LCS: {lcs_ratio:.2f}, AST: {ast_sim:.2f}"}
     except Exception as e:
         logger.error(f"Error comparing with previous submission: {e}")
         return {"is_suspicious": False, "details": str(e)}
@@ -386,15 +496,13 @@ async def detect_plagiarism(code: str, handle: str) -> Dict[str, Any]:
         return {"is_plagiarized": False, "delta": 0.0, "details": "No generated code", "status": "N", "evidence": ["No generated code"]}
     lcs_score = lcs_length(cleaned_code, clean_code(generated_code))
     lcs_ratio = lcs_score / max(len(cleaned_code), len(clean_code(generated_code))) if cleaned_code else 0
-    ast1 = parse_code_to_ast(code)
-    ast2 = parse_code_to_ast(generated_code)
-    ast_similarity = compare_ast(serialize_ast(ast1), serialize_ast(ast2)) if ast1 and ast2 else 0.0
-    is_plagiarized = lcs_ratio >= CONFIG["lcs_threshold"] or ast_similarity >= CONFIG["ast_similarity_threshold"]
-    evidence = [f"LCS: {lcs_ratio:.2f}", f"AST: {ast_similarity:.2f}"]
+    ast_sim = cpp_ast_similarity(code, generated_code)
+    is_plagiarized = lcs_ratio >= CONFIG["lcs_threshold"] or ast_sim >= CONFIG["ast_similarity_threshold"]
+    evidence = [f"LCS: {lcs_ratio:.2f}", f"AST: {ast_sim:.2f}"]
     return {
         "is_plagiarized": is_plagiarized,
         "delta": lcs_ratio,
-        "details": f"LCS: {lcs_ratio:.2f}, AST: {ast_similarity:.2f}",
+        "details": f"LCS: {lcs_ratio:.2f}, AST: {ast_sim:.2f}",
         "status": "S" if is_plagiarized else "N",
         "evidence": evidence
     }
@@ -454,9 +562,11 @@ def detect_similar_codes(code: str, handle: str) -> List[str]:
         similar_handles = []
         for other_handle, other_code in codes.items():
             if other_handle != handle:
-                result = compare_codes(cleaned_code, other_code)
-                if result["is_similar"]:
-                    similar_handles.append(f"{other_handle}: {result['details']}")
+                lcs_score = lcs_length(cleaned_code, clean_code(other_code))
+                lcs_ratio = lcs_score / max(len(cleaned_code), len(clean_code(other_code))) if cleaned_code else 0
+                ast_sim = cpp_ast_similarity(cleaned_code, other_code)
+                if lcs_ratio >= CONFIG["lcs_threshold"] or ast_sim >= CONFIG["ast_similarity_threshold"]:
+                    similar_handles.append(f"{other_handle}: LCS: {lcs_ratio:.2f}, AST: {ast_sim:.2f}")
         OUTPUT_1435.parent.mkdir(parents=True, exist_ok=True)
         with OUTPUT_1435.open("w", encoding="utf-8") as f:
             f.write(f"{len(similar_handles)} similar pairs detected\n\n")
@@ -486,13 +596,7 @@ def generate_report(analysis: Dict[str, Any], plagiarism: Dict[str, Any], handle
 async def startup_event():
     logger.info("Starting application...")
     try:
-        # Verify pyjwt import
-        from jose import jwt
-        logger.info("pyjwt module loaded successfully")
-        if LSTM_MODEL_PATH.exists():
-            global lstm_model
-            lstm_model = tf.keras.models.load_model(LSTM_MODEL_PATH)
-            logger.info("LSTM model loaded")
+        load_lstm_model()
         logger.info("Application startup completed")
     except Exception as e:
         logger.error(f"Startup failed: {e}")
@@ -520,23 +624,40 @@ async def index(request: Request):
 async def register(request: Request, email1: str = Form(...), email2: str = Form(...), password: str = Form(...), handle: str = Form(...)):
     try:
         user_data = UserRegister(email1=email1, email2=email2, password=password, handle=handle)
-        if email_usage.get(email1, 0) >= CONFIG["max_logins_per_email"] or email_usage.get(email2, 0) >= CONFIG["max_logins_per_email"]:
+        today = datetime.now().date()
+        if email1 not in email_usage or email_usage[email1]["date"] != today:
+            email_usage[email1] = {"count": 0, "date": today}
+        if email2 not in email_usage or email_usage[email2]["date"] != today:
+            email_usage[email2] = {"count": 0, "date": today}
+        if email_usage[email1]["count"] >= CONFIG["max_logins_per_email"] or email_usage[email2]["count"] >= CONFIG["max_logins_per_email"]:
             raise HTTPException(status_code=400, detail="Email usage limit exceeded")
-        if email1 in users_db:
+        if email1 in users_db or email2 in users_db:
             raise HTTPException(status_code=400, detail="Email already registered")
-        users_db[email1] = {
-            "email1": email1,
-            "email2": email2,
-            "password": get_password_hash(password),
-            "handle": handle
-        }
-        email_usage[email1] = email_usage.get(email1, 0) + 1
-        email_usage[email2] = email_usage.get(email2, 0) + 1
+        hashed_password = get_password_hash(password)
+        users_db[email1] = {"email1": email1, "email2": email2, "password": hashed_password, "handle": handle}
+        users_db[email2] = {"email1": email1, "email2": email2, "password": hashed_password, "handle": handle}
+        email_usage[email1]["count"] += 1
+        email_usage[email2]["count"] += 1
         log_interaction(request, {"message": f"User {handle} registered"}, {"email1": email1, "handle": handle})
         return templates.TemplateResponse("index.html", {"request": request, "message": f"User {handle} registered successfully"})
     except Exception as e:
         log_interaction(request, {"error": str(e)}, {"email1": email1, "handle": handle})
         return templates.TemplateResponse("index.html", {"request": request, "error": str(e)})
+
+def log_interaction(request: Request, response: Dict[str, Any], input_data: Dict[str, Any]):
+    interaction = {
+        "timestamp": datetime.now().isoformat(),
+        "client_ip": request.client.host,
+        "input": input_data,
+        "response": response
+    }
+    try:
+        INTERACTION_LOG.parent.mkdir(parents=True, exist_ok=True)
+        logs = json.load(INTERACTION_LOG.open("r", encoding="utf-8")) if INTERACTION_LOG.exists() else []
+        logs.append(interaction)
+        INTERACTION_LOG.open("w", encoding="utf-8").write(json.dumps(logs, indent=2))
+    except Exception as e:
+        logger.error(f"Failed to log interaction: {e}")
 
 @app.post("/token", response_model=Token)
 async def login(form_data: OAuth2PasswordRequestForm = Depends()):
@@ -574,6 +695,59 @@ async def analyze_code(request: Request, code: str = Form(..., max_length=100_00
         log_interaction(request, {"error": str(e)}, {"code": code, "handle": handle})
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.post("/check_plagiarism")
+async def check_plagiarism(code_input: CodeInput, current_user: Dict[str, Any] = Depends(get_current_user)):
+    try:
+        today = datetime.now().date()
+        email = current_user["email1"]
+        if email not in email_usage or email_usage[email]["date"] != today:
+            email_usage[email] = {"count": 0, "date": today}
+        email_usage[email]["count"] += 1
+        if email_usage[email]["count"] > CONFIG["max_logins_per_email"]:
+            raise HTTPException(status_code=429, detail="Too many requests for this email")
+        with open(INPUT_1568, "r", encoding="utf-8") as f:
+            reference_text_1568 = f.read()
+        with open(INPUT_1435, "r", encoding="utf-8") as f:
+            reference_text_1435 = f.read()
+        score_1568 = calculate_plagiarism_score(code_input.code, reference_text_1568)
+        score_1435 = calculate_plagiarism_score(code_input.code, reference_text_1435)
+        log_entry = {
+            "timestamp": datetime.now().isoformat(),
+            "user": email,
+            "code_hash": hash(code_input.code),
+            "scores_1568": score_1568,
+            "scores_1435": score_1435
+        }
+        with open(INTERACTION_LOG, "a", encoding="utf-8") as f:
+            f.write(json.dumps(log_entry) + "\n")
+        is_plagiarized = (
+            score_1568["combined_score"] > CONFIG["plagiarism_threshold"] or
+            score_1435["combined_score"] > CONFIG["plagiarism_threshold"]
+        )
+        return {
+            "is_plagiarized": is_plagiarized,
+            "scores": {
+                "against_1568": score_1568,
+                "against_1435": score_1435
+            }
+        }
+    except FileNotFoundError as e:
+        logger.error(f"Reference file not found: {e}")
+        raise HTTPException(status_code=500, detail="Reference files not found")
+    except Exception as e:
+        logger.error(f"Error in check_plagiarism: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/predict_plagiarism_lstm")
+async def predict_plagiarism_lstm_route(code_input: CodeInput, current_user: Dict[str, Any] = Depends(get_current_user)):
+    prediction = predict_plagiarism_lstm(code_input.code)
+    return {"lstm_prediction": prediction}
+
+@app.post("/check_similarity")
+async def check_similarity(code_input1: CodeInput, code_input2: CodeInput, current_user: Dict[str, Any] = Depends(get_current_user)):
+    score = calculate_plagiarism_score(code_input1.code, code_input2.code)
+    return {"similarity_scores": score}
+
 @app.post("/prepare", response_class=HTMLResponse)
 async def prepare_submission(request: Request, code: str = Form(...), handle: str = Form(...), current_user: Dict[str, Any] = Depends(get_current_user)):
     try:
@@ -588,6 +762,43 @@ async def prepare_submission(request: Request, code: str = Form(...), handle: st
         log_interaction(request, {"error": str(e)}, {"code": code, "handle": handle})
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.get("/admin/users")
+async def get_users(current_user: Dict[str, Any] = Depends(get_current_user)):
+    return {"users": users_db}
+
+@app.get("/admin/logs")
+async def get_logs(current_user: Dict[str, Any] = Depends(get_current_user)):
+    try:
+        with open(INTERACTION_LOG, "r", encoding="utf-8") as f:
+            logs = [json.loads(line) for line in f if line.strip()]
+        return {"logs": logs}
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="Log file not found")
+
+@app.post("/admin/ban_ip")
+async def ban_ip(ip_address: str = Form(...), current_user: Dict[str, Any] = Depends(get_current_user)):
+    try:
+        ban_ip(ip_address)
+        return {"message": f"IP {ip_address} banned successfully"}
+    except Exception as e:
+        logger.error(f"Failed to ban IP: {e}")
+        raise HTTPException(status_code=500, detail="Failed to ban IP")
+
+@app.post("/admin/unban_ip")
+async def unban_ip(ip_address: str = Form(...), current_user: Dict[str, Any] = Depends(get_current_user)):
+    try:
+        with open(BANNED_IPS, "r", encoding="utf-8") as f:
+            ips = [line.strip() for line in f if line.strip() != ip_address]
+        with open(BANNED_IPS, "w", encoding="utf-8") as f:
+            for ip in ips:
+                f.write(ip + "\n")
+        return {"message": f"IP {ip_address} unbanned successfully"}
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="Banned IPs file not found")
+    except Exception as e:
+        logger.error(f"Failed to unban IP: {e}")
+        raise HTTPException(status_code=500, detail="Failed to unban IP")
+
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=int(environ.get("PORT", 10000)))
+    uvicorn.run(app, host="0.0.0.0", port=int(environ.get("PORT", 8000)))
