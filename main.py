@@ -21,7 +21,7 @@ from datetime import datetime, timedelta
 from collections import Counter
 import math
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
-from jose import JWTError, jwt
+from jwt import PyJWTError, decode, encode
 from passlib.context import CryptContext
 import tensorflow as tf
 from tensorflow.keras.models import Sequential
@@ -239,16 +239,16 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -
     to_encode = data.copy()
     expire = datetime.utcnow() + (expires_delta or timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
     to_encode.update({"exp": expire})
-    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
 async def get_current_user(token: str = Depends(oauth2_scheme)) -> Dict[str, Any]:
     try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        payload = decode(token, SECRET_KEY, algorithms=[ALGORITHM])
         email: str = payload.get("sub")
         if email is None or email not in users_db:
             raise HTTPException(status_code=401, detail="Invalid credentials")
         return users_db[email]
-    except JWTError:
+    except PyJWTError:
         raise HTTPException(status_code=401, detail="Invalid credentials")
 
 def clean_code(code: str) -> str:
@@ -463,10 +463,10 @@ def compare_with_previous_submission(code: str, handle: str) -> Dict[str, Any]:
                 break
         if not previous_code:
             return {"is_suspicious": False, "details": "No previous submission found"}
-        cleaned_current = clean_code(code)
+        cleaned_current =-clean_code(code)
         cleaned_previous = clean_code(previous_code)
         lcs_score = lcs_length(cleaned_current, cleaned_previous)
-        lcs_ratio = lcs_score / max(len(cleaned_current), len(cleaned_previous)) if cleaned_current and cleaned_previous else 0
+        lcs_ratio = lcs_score / max(cleaned_current, cleaned_previous) if cleaned_current and cleaned_previous else 0
         ast_sim = cpp_ast_similarity(code, previous_code)
         is_suspicious = lcs_ratio >= CONFIG["similarity_threshold"] or ast_sim >= CONFIG["ast_similarity_threshold"]
         return {"is_suspicious": is_suspicious, "details": f"LCS: {lcs_ratio:.2f}, AST: {ast_sim:.2f}"}
