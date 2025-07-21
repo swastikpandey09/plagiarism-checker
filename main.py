@@ -11,9 +11,7 @@ from fastapi.templating import Jinja2Templates
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr, field_validator
-from py7zr import SevenZipFile
 import tempfile
-import shutil
 from os import environ, getenv
 from dotenv import load_dotenv
 from openai import OpenAI, APIError
@@ -31,7 +29,7 @@ from tensorflow.keras.preprocessing.sequence import pad_sequences
 import clang.cindex as clang
 import ast
 
-# Logging setup with JSON formatter
+# Logging setup
 class JSONFormatter(logging.Formatter):
     def format(self, record):
         log_data = {
@@ -59,7 +57,7 @@ if not OPENROUTER_API_KEY or not SECRET_KEY:
     raise RuntimeError("OPENROUTER_API_KEY or SECRET_KEY missing")
 
 # FastAPI app setup
-app = FastAPI(title="Code Plagiarism Detector", version="0.2.3")
+app = FastAPI(title="Code Plagiarism Detector", version="0.2.4")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -74,7 +72,7 @@ templates = Jinja2Templates(directory=Path(__file__).parent / "templates")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 30
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
 
 # Configuration
 BASE_DIR = Path(__file__).resolve().parent
@@ -315,16 +313,8 @@ def lcs_length(str1: str, str2: str) -> int:
     return dp[n][m]
 
 def lcs_similarity(s1: str, s2: str) -> float:
-    m, n = len(s1), len(s2)
-    dp = [[0] * (n + 1) for _ in range(m + 1)]
-    for i in range(1, m + 1):
-        for j in range(1, n + 1):
-            if s1[i - 1] == s2[j - 1]:
-                dp[i][j] = 1 + dp[i - 1][j - 1]
-            else:
-                dp[i][j] = max(dp[i - 1][j], dp[i][j - 1])
-    lcs_length = dp[m][n]
-    return lcs_length / max(m, n) if max(m, n) > 0 else 0.0
+    lcs_len = lcs_length(s1, s2)
+    return lcs_len / max(len(s1), len(s2)) if max(len(s1), len(s2)) > 0 else 0.0
 
 def jaccard_similarity(s1: str, s2: str) -> float:
     set1 = set(s1.split())
@@ -604,14 +594,6 @@ async def startup_event():
         logger.error(f"Startup failed: {e}")
         raise
 
-@app.on_event("shutdown")
-async def shutdown_event():
-    try:
-        shutil.rmtree(tempfile.gettempdir(), ignore_errors=True)
-        logger.info("Cleaned up temporary files")
-    except Exception as e:
-        logger.error(f"Shutdown cleanup failed: {e}")
-
 @app.get("/health", response_model=dict)
 async def health_check():
     return {"status": "healthy"}
@@ -663,13 +645,23 @@ def log_interaction(request: Request, response: Dict[str, Any], input_data: Dict
 
 @app.post("/login", response_class=HTMLResponse)
 async def login(request: Request, email: str = Form(...), password: str = Form(...)):
-    user = users_db.get(email)
-    if not user or not verify_password(password, user["password"]):
-        return templates.TemplateResponse("login.html", {"request": request, "error": "Incorrect email or password"})
-    access_token = create_access_token(data={"sub": email})
-    response = templates.TemplateResponse("login.html", {"request": request, "message": "Login successful"})
-    response.set_cookie(key="access_token", value=access_token, httponly=True)
-    return response
+    try:
+        user = users_db.get(email)
+        if not user or not verify_password(password, user["password"]):
+            return templates.TemplateResponse("login.html", {"request": request, "error": "Incorrect email or password"})
+        access_token = create_access_token(data={"sub": email})
+        response = templates.TemplateResponse("login.html", {"request": request, "message": "Login successful"})
+        response.set_cookie(
+            key="access_token",
+            value=access_token,
+            httponly=True,
+            samesite="lax",
+            secure=False  # Set to True in production with HTTPS
+        )
+        return response
+    except Exception as e:
+        logger.error(f"Login error: {e}")
+        return templates.TemplateResponse("login.html", {"request": request, "error": str(e)})
 
 @app.post("/analyze", response_class=HTMLResponse)
 async def analyze_code(request: Request, code: str = Form(..., max_length=100_000), handle: str = Form(...), language: str = Form(...), current_user: Dict[str, Any] = Depends(get_current_user_from_cookie)):
