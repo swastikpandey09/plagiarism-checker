@@ -620,7 +620,7 @@ async def health_check():
 async def index(request: Request):
     if is_ip_banned(request.client.host):
         raise HTTPException(status_code=403, detail="IP banned")
-    return templates.TemplateResponse("index.html", {"request": request})
+    return templates.TemplateResponse("login.html", {"request": request})
 
 @app.post("/register", response_class=HTMLResponse)
 async def register(request: Request, email1: str = Form(...), email2: str = Form(...), password: str = Form(...), handle: str = Form(...)):
@@ -641,10 +641,10 @@ async def register(request: Request, email1: str = Form(...), email2: str = Form
         email_usage[email1]["count"] += 1
         email_usage[email2]["count"] += 1
         log_interaction(request, {"message": f"User {handle} registered"}, {"email1": email1, "handle": handle})
-        return templates.TemplateResponse("index.html", {"request": request, "message": "Registration successful. Please log in."})
+        return templates.TemplateResponse("login.html", {"request": request, "message": "Registration successful. Please log in."})
     except Exception as e:
         log_interaction(request, {"error": str(e)}, {"email1": email1, "handle": handle})
-        return templates.TemplateResponse("index.html", {"request": request, "error": str(e)})
+        return templates.TemplateResponse("login.html", {"request": request, "error": str(e)})
 
 def log_interaction(request: Request, response: Dict[str, Any], input_data: Dict[str, Any]):
     interaction = {
@@ -665,9 +665,9 @@ def log_interaction(request: Request, response: Dict[str, Any], input_data: Dict
 async def login(request: Request, email: str = Form(...), password: str = Form(...)):
     user = users_db.get(email)
     if not user or not verify_password(password, user["password"]):
-        return templates.TemplateResponse("index.html", {"request": request, "error": "Incorrect email or password"})
+        return templates.TemplateResponse("login.html", {"request": request, "error": "Incorrect email or password"})
     access_token = create_access_token(data={"sub": email})
-    response = templates.TemplateResponse("index.html", {"request": request, "message": "Login successful"})
+    response = templates.TemplateResponse("login.html", {"request": request, "message": "Login successful"})
     response.set_cookie(key="access_token", value=access_token, httponly=True)
     return response
 
@@ -693,10 +693,10 @@ async def analyze_code(request: Request, code: str = Form(..., max_length=100_00
         response_data = {"result": {"handle": handle, "report": report, "confidence": analysis["confidence"], "label": analysis["label"], "code": code}}
         log_interaction(request, response_data, {"code": code, "handle": handle, "language": language})
         await train_lstm_model()
-        return templates.TemplateResponse("index.html", {"request": request, "result": response_data["result"]})
+        return templates.TemplateResponse("login.html", {"request": request, "result": response_data["result"]})
     except Exception as e:
         log_interaction(request, {"error": str(e)}, {"code": code, "handle": handle, "language": language})
-        return templates.TemplateResponse("index.html", {"request": request, "error": str(e)})
+        return templates.TemplateResponse("login.html", {"request": request, "error": str(e)})
 
 if __name__ == "__main__":
     import uvicorn
