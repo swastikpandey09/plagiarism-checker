@@ -120,7 +120,8 @@
                     showSection('login');
                     showMessage('Registration successful. Please log in.');
                 } else {
-                    showMessage(text.match(/<p class="text-red-500 mb-4">(.+?)<\/p>/)?.[1] || 'Registration failed', true);
+                    const errorMatch = text.match(/<p class="text-red-500 mb-4">(.+?)<\/p>/);
+                    showMessage(errorMatch ? errorMatch[1] : 'Registration failed', true);
                 }
             } catch {
                 showMessage('Error: Could not connect to server', true);
@@ -140,7 +141,8 @@
                     body: new URLSearchParams({ email, password })
                 });
                 if (response.ok) {
-                    const accessToken = response.headers.get('set-cookie')?.match(/access_token=([^;]+)/)?.[1];
+                    const setCookie = response.headers.get('set-cookie');
+                    const accessToken = setCookie?.match(/access_token=([^;]+)/)?.[1];
                     if (accessToken) {
                         localStorage.setItem('accessToken', accessToken);
                         showSection('analyze');
@@ -150,7 +152,8 @@
                     }
                 } else {
                     const text = await response.text();
-                    showMessage(text.match(/<p class="text-red-500 mb-4">(.+?)<\/p>/)?.[1] || 'Login failed', true);
+                    const errorMatch = text.match(/<p class="text-red-500 mb-4">(.+?)<\/p>/);
+                    showMessage(errorMatch ? errorMatch[1] : 'Login failed', true);
                 }
             } catch {
                 showMessage('Error: Could not connect to server', true);
@@ -176,16 +179,19 @@
                 });
                 const text = await response.text();
                 if (response.ok) {
-                    const reportMatch = text.match(/<pre class="bg-gray-50 p-4 rounded text-sm whitespace-pre-wrap">(.+?)<\/pre>/s);
-                    const report = reportMatch ? reportMatch[1] : 'No report generated';
+                    const resultMatch = text.match(/<script>window\.result = ({.+?});<\/script>/s);
+                    const result = resultMatch ? JSON.parse(resultMatch[1]) : {};
+                    const report = result?.result?.report || 'No report generated';
+                    const submittedCode = result?.result?.code || code;
                     document.getElementById('result').innerHTML = `
                         <h3 class="text-lg font-semibold mt-4">Submitted Code:</h3>
-                        <pre>${code}</pre>
+                        <pre>${submittedCode}</pre>
                         <h3 class="text-lg font-semibold mt-4">Analysis Result:</h3>
                         <pre>${report}</pre>
                     `;
                 } else {
-                    showMessage(text.match(/<p class="text-red-500 mb-4">(.+?)<\/p>/)?.[1] || 'Analysis failed', true);
+                    const errorMatch = text.match(/<p class="text-red-500 mb-4">(.+?)<\/p>/);
+                    showMessage(errorMatch ? errorMatch[1] : 'Analysis failed', true);
                 }
             } catch {
                 showMessage('Error: Could not connect to server', true);
