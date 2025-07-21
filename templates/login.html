@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Code Plagiarism Detector</title>
+    <title>Code Plagiarism checker</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <style>
         body { font-family: sans-serif; }
@@ -18,7 +18,7 @@
 
         <!-- Registration Section -->
         <div id="register" class="hidden bg-white p-6 rounded-lg shadow-md">
-            <h2 class="text-xl font-semibold text-gray-700 mb-4">Register</h2>
+            <h2 class="text-xl font-semibold text-gray-700 mb-4">Register to Code Plagiarism checker</h2>
             <form id="registerForm" class="space-y-4">
                 <input type="email" id="email1" placeholder="Primary Email" required class="w-full p-2 border border-gray-300 rounded">
                 <input type="email" id="email2" placeholder="Secondary Email" required class="w-full p-2 border border-gray-300 rounded">
@@ -30,29 +30,28 @@
 
         <!-- Login Section -->
         <div id="login" class="hidden bg-white p-6 rounded-lg shadow-md">
-            <h2 class="text-xl font-semibold text-gray-700 mb-4">Login</h2>
+            <h2 class="text-xl font-semibold text-gray-700 mb-4">Login to Code Plagiarism checker</h2>
             <form id="loginForm" class="space-y-4">
                 <input type="email" id="loginEmail" placeholder="Email" required class="w-full p-2 border border-gray-300 rounded">
                 <input type="password" id="loginPassword" placeholder="Password" required class="w-full p-2 border border-gray-300 rounded">
                 <button type="submit" class="bg-blue-500 text-white p-2 rounded hover:bg-blue-600">Login</button>
             </form>
-            <p class="mt-4">Don't have an account? <a href="#" id="registerLink" class="text-blue-500">Register here</a></p>
+            <p class="mt-4">Don't have an account? <a href="#" id="registerLink" class="text-blue-500">Register to Code Plagiarism checker here</a></p>
         </div>
 
         <!-- Analyze Code Section -->
         <div id="analyze" class="hidden bg-white p-6 rounded-lg shadow-md">
-            <h2 class="text-xl font-semibold text-gray-700 mb-4">Analyze Code</h2>
+            <h2 class="text-xl font-semibold text-gray-700 mb-4">Analyze code <h3>with Code Plagiarism checker</h3></h2>
             <form id="analyzeForm" class="space-y-4">
                 <textarea id="code" placeholder="Paste your code here" required class="w-full p-2 border border-gray-300 rounded h-48"></textarea>
                 <input type="text" id="analyzeHandle" placeholder="Your Handle" required class="w-full p-2 border border-gray-300 rounded">
                 <select id="language" class="w-full p-2 border border-gray-300 rounded">
                     <option value="cpp">C++</option>
-                    <option value="python">Python</option>
                 </select>
                 <button type="submit" class="bg-blue-500 text-white p-2 rounded hover:bg-blue-600">Analyze</button>
             </form>
             <div id="result" class="mt-4 text-gray-700"></div>
-            <button id="logout" class="mt-4 bg-red-500 text-white p-2 rounded hover:bg-red-600">Logout</button>
+            <button id="logout" class="mt-4 bg-red-500 text-white p-2 rounded hover:bg-red-600">Logout from Code Plagiarism checker</button>
         </div>
     </div>
 
