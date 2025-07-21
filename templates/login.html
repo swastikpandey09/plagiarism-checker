@@ -6,16 +6,16 @@
     <title>Code Plagiarism Detector</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <style>
-        body {
-            font-family: sans-serif;
-        }
-        .hidden {
-            display: none;
-        }
+        body { font-family: sans-serif; }
+        .hidden { display: none; }
+        pre { background-color: #f8f8f8; padding: 1rem; border-radius: 0.5rem; overflow-x: auto; }
     </style>
 </head>
 <body class="bg-gray-100">
     <div class="max-w-md mx-auto p-6">
+        <!-- Error/Message Display -->
+        <div id="message" class="hidden mb-4"></div>
+
         <!-- Registration Section -->
         <div id="register" class="hidden bg-white p-6 rounded-lg shadow-md">
             <h2 class="text-xl font-semibold text-gray-700 mb-4">Register</h2>
@@ -36,6 +36,7 @@
                 <input type="password" id="loginPassword" placeholder="Password" required class="w-full p-2 border border-gray-300 rounded">
                 <button type="submit" class="bg-blue-500 text-white p-2 rounded hover:bg-blue-600">Login</button>
             </form>
+            <p class="mt-4">Don't have an account? <a href="#" id="registerLink" class="text-blue-500">Register here</a></p>
         </div>
 
         <!-- Analyze Code Section -->
@@ -61,58 +62,147 @@
             ['register', 'login', 'analyze'].forEach(id => {
                 document.getElementById(id).classList.toggle('hidden', id !== sectionId);
             });
+            document.getElementById('message').classList.add('hidden');
+        }
+
+        // Function to display messages
+        function showMessage(text, isError = false) {
+            const messageDiv = document.getElementById('message');
+            messageDiv.textContent = text;
+            messageDiv.classList.remove('hidden', 'text-green-500', 'text-red-500');
+            messageDiv.classList.add(isError ? 'text-red-500' : 'text-green-500');
         }
 
         // Check user state on page load
-        window.addEventListener('load', function() {
+        window.addEventListener('load', async function() {
             const registered = localStorage.getItem('registered') === 'true';
-            const loggedIn = localStorage.getItem('loggedIn') === 'true';
+            const accessToken = localStorage.getItem('accessToken');
 
             if (!registered) {
                 showSection('register');
-            } else if (!loggedIn) {
+            } else if (!accessToken) {
                 showSection('login');
             } else {
-                showSection('analyze');
+                try {
+                    const response = await fetch('/health', {
+                        headers: { 'Authorization': `Bearer ${accessToken}` }
+                    });
+                    if (response.ok) {
+                        showSection('analyze');
+                    } else {
+                        localStorage.removeItem('accessToken');
+                        showSection('login');
+                    }
+                } catch {
+                    localStorage.removeItem('accessToken');
+                    showSection('login');
+                }
             }
         });
 
         // Handle registration form submission
-        document.getElementById('registerForm').addEventListener('submit', function(event) {
+        document.getElementById('registerForm').addEventListener('submit', async function(event) {
             event.preventDefault();
             const email1 = document.getElementById('email1').value;
             const email2 = document.getElementById('email2').value;
-            if (email1 === email2) {
-                alert('Emails must be different');
-                return;
+            const password = document.getElementById('password').value;
+            const handle = document.getElementById('handle').value;
+
+            try {
+                const response = await fetch('/register', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                    body: new URLSearchParams({ email1, email2, password, handle })
+                });
+                const text = await response.text();
+                if (response.ok) {
+                    localStorage.setItem('registered', 'true');
+                    showSection('login');
+                    showMessage('Registration successful. Please log in.');
+                } else {
+                    showMessage(text.match(/<p class="text-red-500 mb-4">(.+?)<\/p>/)?.[1] || 'Registration failed', true);
+                }
+            } catch {
+                showMessage('Error: Could not connect to server', true);
             }
-            // Simulate database storage with localStorage
-            localStorage.setItem('registered', 'true');
-            showSection('login');
         });
 
         // Handle login form submission
-        document.getElementById('loginForm').addEventListener('submit', function(event) {
+        document.getElementById('loginForm').addEventListener('submit', async function(event) {
             event.preventDefault();
-            // Simulate database login with localStorage
-            localStorage.setItem('loggedIn', 'true');
-            showSection('analyze');
+            const email = document.getElementById('loginEmail').value;
+            const password = document.getElementById('loginPassword').value;
+
+            try {
+                const response = await fetch('/login', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                    body: new URLSearchParams({ email, password })
+                });
+                if (response.ok) {
+                    const accessToken = response.headers.get('set-cookie')?.match(/access_token=([^;]+)/)?.[1];
+                    if (accessToken) {
+                        localStorage.setItem('accessToken', accessToken);
+                        showSection('analyze');
+                        showMessage('Login successful');
+                    } else {
+                        showMessage('Login failed: No token received', true);
+                    }
+                } else {
+                    const text = await response.text();
+                    showMessage(text.match(/<p class="text-red-500 mb-4">(.+?)<\/p>/)?.[1] || 'Login failed', true);
+                }
+            } catch {
+                showMessage('Error: Could not connect to server', true);
+            }
         });
 
         // Handle analyze form submission
-        document.getElementById('analyzeForm').addEventListener('submit', function(event) {
+        document.getElementById('analyzeForm').addEventListener('submit', async function(event) {
             event.preventDefault();
             const code = document.getElementById('code').value;
             const handle = document.getElementById('analyzeHandle').value;
             const language = document.getElementById('language').value;
-            // Display a placeholder result (can be extended with real analysis)
-            document.getElementById('result').innerText = `Analyzing code for ${handle} in ${language}...\n\nCode:\n${code}`;
+            const accessToken = localStorage.getItem('accessToken');
+
+            try {
+                const response = await fetch('/analyze', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/x-www-form-urlencoded',
+                        'Authorization': `Bearer ${accessToken}`
+                    },
+                    body: new URLSearchParams({ code, handle, language })
+                });
+                const text = await response.text();
+                if (response.ok) {
+                    const reportMatch = text.match(/<pre class="bg-gray-50 p-4 rounded text-sm whitespace-pre-wrap">(.+?)<\/pre>/s);
+                    const report = reportMatch ? reportMatch[1] : 'No report generated';
+                    document.getElementById('result').innerHTML = `
+                        <h3 class="text-lg font-semibold mt-4">Submitted Code:</h3>
+                        <pre>${code}</pre>
+                        <h3 class="text-lg font-semibold mt-4">Analysis Result:</h3>
+                        <pre>${report}</pre>
+                    `;
+                } else {
+                    showMessage(text.match(/<p class="text-red-500 mb-4">(.+?)<\/p>/)?.[1] || 'Analysis failed', true);
+                }
+            } catch {
+                showMessage('Error: Could not connect to server', true);
+            }
         });
 
         // Handle logout
         document.getElementById('logout').addEventListener('click', function() {
-            localStorage.setItem('loggedIn', 'false');
+            localStorage.removeItem('accessToken');
             showSection('login');
+            showMessage('Logged out successfully');
+        });
+
+        // Handle register link
+        document.getElementById('registerLink').addEventListener('click', function(event) {
+            event.preventDefault();
+            showSection('register');
         });
     </script>
 </body>
