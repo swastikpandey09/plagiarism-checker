@@ -5,61 +5,115 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Code Plagiarism Detector</title>
     <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        body {
+            font-family: sans-serif;
+        }
+        .hidden {
+            display: none;
+        }
+    </style>
 </head>
-<body class="bg-gray-100 font-sans">
-    <div class="max-w-4xl mx-auto p-6">
-        <h1 class="text-3xl font-bold text-gray-800 mb-6">Code Plagiarism Detector</h1>
-        
-        {% if error %}
-            <p class="text-red-500 mb-4">{{ error }}</p>
-        {% endif %}
-        {% if message %}
-            <p class="text-green-500 mb-4">{{ message }}</p>
-        {% endif %}
-
-        <div class="bg-white p-6 rounded-lg shadow-md mb-6">
+<body class="bg-gray-100">
+    <div class="max-w-md mx-auto p-6">
+        <!-- Registration Section -->
+        <div id="register" class="hidden bg-white p-6 rounded-lg shadow-md">
             <h2 class="text-xl font-semibold text-gray-700 mb-4">Register</h2>
-            <form action="/register" method="post" class="space-y-4">
-                <input type="email" name="email1" placeholder="Primary Email" required
-                       class="w-full p-2 border border-gray-300 rounded">
-                <input type="email" name="email2" placeholder="Secondary Email (different from primary)" required
-                       class="w-full p-2 border border-gray-300 rounded">
-                <input type="password" name="password" placeholder="Password" required
-                       class="w-full p-2 border border-gray-300 rounded">
-                <input type="text" name="handle" placeholder="Handle (alphanumeric)" required
-                       class="w-full p-2 border border-gray-300 rounded">
+            <form id="registerForm" class="space-y-4">
+                <input type="email" id="email1" placeholder="Primary Email" required class="w-full p-2 border border-gray-300 rounded">
+                <input type="email" id="email2" placeholder="Secondary Email" required class="w-full p-2 border border-gray-300 rounded">
+                <input type="password" id="password" placeholder="Password" required class="w-full p-2 border border-gray-300 rounded">
+                <input type="text" id="handle" placeholder="Handle" required class="w-full p-2 border border-gray-300 rounded">
                 <button type="submit" class="bg-blue-500 text-white p-2 rounded hover:bg-blue-600">Register</button>
             </form>
         </div>
 
-        <div class="bg-white p-6 rounded-lg shadow-md mb-6">
+        <!-- Login Section -->
+        <div id="login" class="hidden bg-white p-6 rounded-lg shadow-md">
             <h2 class="text-xl font-semibold text-gray-700 mb-4">Login</h2>
-            <form action="/token" method="post" class="space-y-4">
-                <input type="email" name="username" placeholder="Email" required
-                       class="w-full p-2 border border-gray-300 rounded">
-                <input type="password" name="password" placeholder="Password" required
-                       class="w-full p-2 border border-gray-300 rounded">
+            <form id="loginForm" class="space-y-4">
+                <input type="email" id="loginEmail" placeholder="Email" required class="w-full p-2 border border-gray-300 rounded">
+                <input type="password" id="loginPassword" placeholder="Password" required class="w-full p-2 border border-gray-300 rounded">
                 <button type="submit" class="bg-blue-500 text-white p-2 rounded hover:bg-blue-600">Login</button>
             </form>
         </div>
 
-        <div class="bg-white p-6 rounded-lg shadow-md mb-6">
+        <!-- Analyze Code Section -->
+        <div id="analyze" class="hidden bg-white p-6 rounded-lg shadow-md">
             <h2 class="text-xl font-semibold text-gray-700 mb-4">Analyze Code</h2>
-            <form action="/analyze" method="post" class="space-y-4">
-                <textarea name="code" placeholder="Paste your C++ code here" required
-                          class="w-full p-2 border border-gray-300 rounded h-48"></textarea>
-                <input type="text" name="handle" placeholder="Your Handle" required
-                       class="w-full p-2 border border-gray-300 rounded">
+            <form id="analyzeForm" class="space-y-4">
+                <textarea id="code" placeholder="Paste your code here" required class="w-full p-2 border border-gray-300 rounded h-48"></textarea>
+                <input type="text" id="analyzeHandle" placeholder="Your Handle" required class="w-full p-2 border border-gray-300 rounded">
+                <select id="language" class="w-full p-2 border border-gray-300 rounded">
+                    <option value="cpp">C++</option>
+                    <option value="python">Python</option>
+                </select>
                 <button type="submit" class="bg-blue-500 text-white p-2 rounded hover:bg-blue-600">Analyze</button>
             </form>
+            <div id="result" class="mt-4 text-gray-700"></div>
+            <button id="logout" class="mt-4 bg-red-500 text-white p-2 rounded hover:bg-red-600">Logout</button>
         </div>
-
-        {% if result %}
-            <div class="bg-white p-6 rounded-lg shadow-md">
-                <h2 class="text-xl font-semibold text-gray-700 mb-4">Analysis Result for {{ result.handle }}</h2>
-                <pre class="bg-gray-50 p-4 rounded text-sm whitespace-pre-wrap">{{ result.report }}</pre>
-            </div>
-        {% endif %}
     </div>
+
+    <script>
+        // Function to show the specified section and hide others
+        function showSection(sectionId) {
+            ['register', 'login', 'analyze'].forEach(id => {
+                document.getElementById(id).classList.toggle('hidden', id !== sectionId);
+            });
+        }
+
+        // Check user state on page load
+        window.addEventListener('load', function() {
+            const registered = localStorage.getItem('registered') === 'true';
+            const loggedIn = localStorage.getItem('loggedIn') === 'true';
+
+            if (!registered) {
+                showSection('register');
+            } else if (!loggedIn) {
+                showSection('login');
+            } else {
+                showSection('analyze');
+            }
+        });
+
+        // Handle registration form submission
+        document.getElementById('registerForm').addEventListener('submit', function(event) {
+            event.preventDefault();
+            const email1 = document.getElementById('email1').value;
+            const email2 = document.getElementById('email2').value;
+            if (email1 === email2) {
+                alert('Emails must be different');
+                return;
+            }
+            // Simulate database storage with localStorage
+            localStorage.setItem('registered', 'true');
+            showSection('login');
+        });
+
+        // Handle login form submission
+        document.getElementById('loginForm').addEventListener('submit', function(event) {
+            event.preventDefault();
+            // Simulate database login with localStorage
+            localStorage.setItem('loggedIn', 'true');
+            showSection('analyze');
+        });
+
+        // Handle analyze form submission
+        document.getElementById('analyzeForm').addEventListener('submit', function(event) {
+            event.preventDefault();
+            const code = document.getElementById('code').value;
+            const handle = document.getElementById('analyzeHandle').value;
+            const language = document.getElementById('language').value;
+            // Display a placeholder result (can be extended with real analysis)
+            document.getElementById('result').innerText = `Analyzing code for ${handle} in ${language}...\n\nCode:\n${code}`;
+        });
+
+        // Handle logout
+        document.getElementById('logout').addEventListener('click', function() {
+            localStorage.setItem('loggedIn', 'false');
+            showSection('login');
+        });
+    </script>
 </body>
 </html>
