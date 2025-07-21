@@ -20,7 +20,7 @@ from openai import OpenAI, APIError
 from datetime import datetime, timedelta
 from collections import Counter
 import math
-from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from fastapi.security import OAuth2PasswordBearer
 from jwt import PyJWTError, decode, encode
 from passlib.context import CryptContext
 import tensorflow as tf
@@ -143,10 +143,6 @@ class CodeInput(BaseModel):
             raise ValueError("Language must be 'cpp' or 'python'")
         return v
 
-class Token(BaseModel):
-    access_token: str
-    token_type: str
-
 # Global state
 users_db: Dict[str, Dict[str, Any]] = {}
 email_usage: Dict[str, Dict[str, Any]] = {}
@@ -154,7 +150,7 @@ tokenizer = Tokenizer()
 lstm_model = None
 MAX_SEQUENCE_LENGTH = 1000
 
-# Initialize tokenizer with dummy data if empty
+# Initialize tokenizer
 if not tokenizer.word_index:
     tokenizer.fit_on_texts(["def main():\n    print(\"Hello World\")", "import os\nimport sys"])
 
@@ -247,16 +243,6 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -
     expire = datetime.utcnow() + (expires_delta or timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
     to_encode.update({"exp": expire})
     return encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
-
-async def get_current_user(token: str = Depends(oauth2_scheme)) -> Dict[str, Any]:
-    try:
-        payload = decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        email: str = payload.get("sub")
-        if email is None or email not in users_db:
-            raise HTTPException(status_code=401, detail="Invalid credentials")
-        return users_db[email]
-    except PyJWTError:
-        raise HTTPException(status_code=401, detail="Invalid credentials")
 
 async def get_current_user_from_cookie(request: Request):
     access_token = request.cookies.get("access_token")
@@ -363,10 +349,8 @@ def cosine_similarity(text1: str, text2: str) -> float:
 def winnowing_hash_similarity(text1: str, text2: str, k: int = 5, w: int = 10) -> float:
     def get_ngrams(text, n):
         return [text[i:i+n] for i in range(len(text) - n + 1)]
-
     def get_hashes(ngrams):
         return [hash(ngram) for ngram in ngrams]
-
     def get_fingerprints(hashes, window_size):
         fingerprints = set()
         if len(hashes) < window_size:
@@ -376,14 +360,12 @@ def winnowing_hash_similarity(text1: str, text2: str, k: int = 5, w: int = 10) -
             min_hash = min(window)
             fingerprints.add(min_hash)
         return fingerprints
-
     ngrams1 = get_ngrams(text1, k)
     ngrams2 = get_ngrams(text2, k)
     hashes1 = get_hashes(ngrams1)
     hashes2 = get_hashes(ngrams2)
     fingerprints1 = get_fingerprints(hashes1, w)
     fingerprints2 = get_fingerprints(hashes2, w)
-
     intersection = len(fingerprints1.intersection(fingerprints2))
     union = len(fingerprints1.union(fingerprints2))
     return intersection / union if union > 0 else 0.0
@@ -404,7 +386,6 @@ def cpp_ast_similarity(code1: str, code2: str) -> float:
         except Exception as e:
             logger.error(f"AST parsing failed: {e}")
             return None
-
     def serialize_ast(cursor: clang.cindex.Cursor) -> List[Dict[str, Any]]:
         if not cursor:
             return []
@@ -412,7 +393,6 @@ def cpp_ast_similarity(code1: str, code2: str) -> float:
         for child in cursor.get_children():
             nodes[0]["children"].extend(serialize_ast(child))
         return nodes
-
     ast1 = parse_code_to_ast(code1)
     ast2 = parse_code_to_ast(code2)
     if not ast1 or not ast2:
@@ -539,8 +519,7 @@ async def query_api(messages: List[Dict[str, str]], model: str = "moonshotai/kim
             temperature=0.7,
             max_tokens=2000
         )
-        content = response.choices[0].message.content.strip()
-        return content
+        return response.choices[0].message.content.strip()
     except APIError as e:
         logger.error(f"OpenRouter API error: {e}")
         return ""
@@ -641,22 +620,7 @@ async def health_check():
 async def index(request: Request):
     if is_ip_banned(request.client.host):
         raise HTTPException(status_code=403, detail="IP banned")
-    access_token = request.cookies.get("access_token")
-    if access_token:
-        try:
-            payload = decode(access_token, SECRET_KEY, algorithms=[ALGORITHM])
-            email = payload.get("sub")
-            if email and email in users_db:
-                return templates.TemplateResponse("analyze.html", {"request": request})
-        except PyJWTError:
-            pass
-    return templates.TemplateResponse("login.html", {"request": request})
-
-@app.get("/register", response_class=HTMLResponse)
-async def get_register(request: Request):
-    if is_ip_banned(request.client.host):
-        raise HTTPException(status_code=403, detail="IP banned")
-    return templates.TemplateResponse("register.html", {"request": request})
+    return templates.TemplateResponse("index.html", {"request": request})
 
 @app.post("/register", response_class=HTMLResponse)
 async def register(request: Request, email1: str = Form(...), email2: str = Form(...), password: str = Form(...), handle: str = Form(...)):
@@ -677,10 +641,10 @@ async def register(request: Request, email1: str = Form(...), email2: str = Form
         email_usage[email1]["count"] += 1
         email_usage[email2]["count"] += 1
         log_interaction(request, {"message": f"User {handle} registered"}, {"email1": email1, "handle": handle})
-        return templates.TemplateResponse("login.html", {"request": request, "message": "Registration successful. Please log in."})
+        return templates.TemplateResponse("index.html", {"request": request, "message": "Registration successful. Please log in."})
     except Exception as e:
         log_interaction(request, {"error": str(e)}, {"email1": email1, "handle": handle})
-        return templates.TemplateResponse("register.html", {"request": request, "error": str(e)})
+        return templates.TemplateResponse("index.html", {"request": request, "error": str(e)})
 
 def log_interaction(request: Request, response: Dict[str, Any], input_data: Dict[str, Any]):
     interaction = {
@@ -701,19 +665,11 @@ def log_interaction(request: Request, response: Dict[str, Any], input_data: Dict
 async def login(request: Request, email: str = Form(...), password: str = Form(...)):
     user = users_db.get(email)
     if not user or not verify_password(password, user["password"]):
-        return templates.TemplateResponse("login.html", {"request": request, "error": "Incorrect email or password"})
+        return templates.TemplateResponse("index.html", {"request": request, "error": "Incorrect email or password"})
     access_token = create_access_token(data={"sub": email})
-    response = templates.TemplateResponse("analyze.html", {"request": request, "message": "Login successful"})
+    response = templates.TemplateResponse("index.html", {"request": request, "message": "Login successful"})
     response.set_cookie(key="access_token", value=access_token, httponly=True)
     return response
-
-@app.post("/token", response_model=Token)
-async def token(form_data: OAuth2PasswordRequestForm = Depends()):
-    user = users_db.get(form_data.username)
-    if not user or not verify_password(form_data.password, user["password"]):
-        raise HTTPException(status_code=401, detail="Incorrect email or password")
-    access_token = create_access_token(data={"sub": form_data.username})
-    return {"access_token": access_token, "token_type": "bearer"}
 
 @app.post("/analyze", response_class=HTMLResponse)
 async def analyze_code(request: Request, code: str = Form(..., max_length=100_000), handle: str = Form(...), language: str = Form(...), current_user: Dict[str, Any] = Depends(get_current_user_from_cookie)):
@@ -734,116 +690,13 @@ async def analyze_code(request: Request, code: str = Form(..., max_length=100_00
         similar_handles = detect_similar_codes(code, handle, language)
         analysis["similar_handles"] = similar_handles
         report = generate_report(analysis, plagiarism, handle)
-        process_code_submission(code, handle)
-        response_data = {"result": {"handle": handle, "report": report, "confidence": analysis["confidence"], "label": analysis["label"]}}
+        response_data = {"result": {"handle": handle, "report": report, "confidence": analysis["confidence"], "label": analysis["label"], "code": code}}
         log_interaction(request, response_data, {"code": code, "handle": handle, "language": language})
         await train_lstm_model()
-        return templates.TemplateResponse("analyze.html", {"request": request, "result": response_data["result"]})
+        return templates.TemplateResponse("index.html", {"request": request, "result": response_data["result"]})
     except Exception as e:
         log_interaction(request, {"error": str(e)}, {"code": code, "handle": handle, "language": language})
-        return templates.TemplateResponse("analyze.html", {"request": request, "error": str(e)})
-
-@app.post("/check_plagiarism")
-async def check_plagiarism(code_input: CodeInput, current_user: Dict[str, Any] = Depends(get_current_user)):
-    try:
-        today = datetime.now().date()
-        email = current_user["email1"]
-        if email not in email_usage or email_usage[email]["date"] != today:
-            email_usage[email] = {"count": 0, "date": today}
-        email_usage[email]["count"] += 1
-        if email_usage[email]["count"] > CONFIG["max_logins_per_email"]:
-            raise HTTPException(status_code=429, detail="Too many requests for this email")
-        reference_text_1568 = INPUT_1568.read_text(encoding="utf-8") if INPUT_1568.exists() else ""
-        reference_text_1435 = INPUT_1435.read_text(encoding="utf-8") if INPUT_1435.exists() else ""
-        score_1568 = calculate_plagiarism_score(code_input.code, reference_text_1568)
-        score_1435 = calculate_plagiarism_score(code_input.code, reference_text_1435)
-        log_entry = {
-            "timestamp": datetime.now().isoformat(),
-            "user": email,
-            "code_hash": hash(code_input.code),
-            "scores_1568": score_1568,
-            "scores_1435": score_1435
-        }
-        with open(INTERACTION_LOG, "a", encoding="utf-8") as f:
-            f.write(json.dumps(log_entry) + "\n")
-        is_plagiarized = (
-            score_1568["combined_score"] > CONFIG["plagiarism_threshold"] or
-            score_1435["combined_score"] > CONFIG["plagiarism_threshold"]
-        )
-        return {
-            "is_plagiarized": is_plagiarized,
-            "scores": {
-                "against_1568": score_1568,
-                "against_1435": score_1435
-            }
-        }
-    except FileNotFoundError as e:
-        logger.error(f"Reference file not found: {e}")
-        raise HTTPException(status_code=500, detail="Reference files not found")
-    except Exception as e:
-        logger.error(f"Error in check_plagiarism: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/predict_plagiarism_lstm")
-async def predict_plagiarism_lstm_route(code_input: CodeInput, current_user: Dict[str, Any] = Depends(get_current_user)):
-    prediction = predict_plagiarism_lstm(code_input.code)
-    return {"lstm_prediction": prediction}
-
-@app.post("/check_similarity")
-async def check_similarity(code_input1: CodeInput, code_input2: CodeInput, current_user: Dict[str, Any] = Depends(get_current_user)):
-    score = calculate_plagiarism_score(code_input1.code, code_input2.code)
-    return {"similarity_scores": score}
-
-@app.post("/prepare", response_class=HTMLResponse)
-async def prepare_submission(request: Request, code: str = Form(...), handle: str = Form(...), current_user: Dict[str, Any] = Depends(get_current_user)):
-    try:
-        if is_ip_banned(request.client.host):
-            raise HTTPException(status_code=403, detail="IP banned")
-        CodeInput(code=code, handle=handle, language="cpp")
-        process_code_submission(code, handle)
-        response_data = {"message": f"Code for {handle} prepared"}
-        log_interaction(request, response_data, {"code": code, "handle": handle})
-        return templates.TemplateResponse("analyze.html", {"request": request, "message": response_data["message"]})
-    except Exception as e:
-        log_interaction(request, {"error": str(e)}, {"code": code, "handle": handle})
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/admin/users")
-async def get_users(current_user: Dict[str, Any] = Depends(get_current_user)):
-    return {"users": users_db}
-
-@app.get("/admin/logs")
-async def get_logs(current_user: Dict[str, Any] = Depends(get_current_user)):
-    try:
-        with open(INTERACTION_LOG, "r", encoding="utf-8") as f:
-            logs = [json.loads(line) for line in f if line.strip()]
-        return {"logs": logs}
-    except FileNotFoundError:
-        raise HTTPException(status_code=404, detail="Log file not found")
-
-@app.post("/admin/ban_ip")
-async def ban_ip(ip_address: str = Form(...), current_user: Dict[str, Any] = Depends(get_current_user)):
-    try:
-        ban_ip(ip_address)
-        return {"message": f"IP {ip_address} banned successfully"}
-    except Exception as e:
-        logger.error(f"Failed to ban IP: {e}")
-        raise HTTPException(status_code=500, detail="Failed to ban IP")
-
-@app.post("/admin/unban_ip")
-async def unban_ip(ip_address: str = Form(...), current_user: Dict[str, Any] = Depends(get_current_user)):
-    try:
-        with open(BANNED_IPS, "r", encoding="utf-8") as f:
-            ips = [line.strip() for line in f if line.strip() != ip_address]
-        with open(BANNED_IPS, "w", encoding="utf-8") as f:
-            for ip in ips:
-                f.write(ip + "\n")
-        return {"message": f"IP {ip_address} unbanned successfully"}
-    except FileNotFoundError:
-        raise HTTPException(status_code=404, detail="Banned IPs file not found")
-    except Exception as e:
-        logger.error(f"Failed to unban IP: {e}")
-        raise HTTPException(status_code=500, detail="Failed to unban IP")
+        return templates.TemplateResponse("index.html", {"request": request, "error": str(e)})
 
 if __name__ == "__main__":
     import uvicorn
