@@ -156,8 +156,9 @@ class UserRegister(BaseModel):
         return v
 
     @field_validator("email2")
-    def emails_different(cls, v, values):
-        if "email1" in values and v == values["email1"]:
+    def emails_different(cls, v, info: ValidationInfo):
+        email1 = info.data.get("email1")
+        if email1 and v == email1:
             raise ValueError("Emails must be different")
         return v
 
