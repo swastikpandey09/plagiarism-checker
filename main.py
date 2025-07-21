@@ -258,6 +258,19 @@ async def get_current_user(token: str = Depends(oauth2_scheme)) -> Dict[str, Any
     except PyJWTError:
         raise HTTPException(status_code=401, detail="Invalid credentials")
 
+async def get_current_user_from_cookie(request: Request):
+    access_token = request.cookies.get("access_token")
+    if not access_token:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    try:
+        payload = decode(access_token, SECRET_KEY, algorithms=[ALGORITHM])
+        email = payload.get("sub")
+        if email is None or email not in users_db:
+            raise HTTPException(status_code=401, detail="Invalid credentials")
+        return users_db[email]
+    except PyJWTError:
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+
 def clean_code(code: str) -> str:
     if not code:
         return ""
@@ -628,7 +641,22 @@ async def health_check():
 async def index(request: Request):
     if is_ip_banned(request.client.host):
         raise HTTPException(status_code=403, detail="IP banned")
-    return templates.TemplateResponse("index.html", {"request": request})
+    access_token = request.cookies.get("access_token")
+    if access_token:
+        try:
+            payload = decode(access_token, SECRET_KEY, algorithms=[ALGORITHM])
+            email = payload.get("sub")
+            if email and email in users_db:
+                return templates.TemplateResponse("analyze.html", {"request": request})
+        except PyJWTError:
+            pass
+    return templates.TemplateResponse("login.html", {"request": request})
+
+@app.get("/register", response_class=HTMLResponse)
+async def get_register(request: Request):
+    if is_ip_banned(request.client.host):
+        raise HTTPException(status_code=403, detail="IP banned")
+    return templates.TemplateResponse("register.html", {"request": request})
 
 @app.post("/register", response_class=HTMLResponse)
 async def register(request: Request, email1: str = Form(...), email2: str = Form(...), password: str = Form(...), handle: str = Form(...)):
@@ -649,10 +677,10 @@ async def register(request: Request, email1: str = Form(...), email2: str = Form
         email_usage[email1]["count"] += 1
         email_usage[email2]["count"] += 1
         log_interaction(request, {"message": f"User {handle} registered"}, {"email1": email1, "handle": handle})
-        return templates.TemplateResponse("index.html", {"request": request, "message": f"User {handle} registered successfully"})
+        return templates.TemplateResponse("login.html", {"request": request, "message": "Registration successful. Please log in."})
     except Exception as e:
         log_interaction(request, {"error": str(e)}, {"email1": email1, "handle": handle})
-        return templates.TemplateResponse("index.html", {"request": request, "error": str(e)})
+        return templates.TemplateResponse("register.html", {"request": request, "error": str(e)})
 
 def log_interaction(request: Request, response: Dict[str, Any], input_data: Dict[str, Any]):
     interaction = {
@@ -669,8 +697,18 @@ def log_interaction(request: Request, response: Dict[str, Any], input_data: Dict
     except Exception as e:
         logger.error(f"Failed to log interaction: {e}")
 
+@app.post("/login", response_class=HTMLResponse)
+async def login(request: Request, email: str = Form(...), password: str = Form(...)):
+    user = users_db.get(email)
+    if not user or not verify_password(password, user["password"]):
+        return templates.TemplateResponse("login.html", {"request": request, "error": "Incorrect email or password"})
+    access_token = create_access_token(data={"sub": email})
+    response = templates.TemplateResponse("analyze.html", {"request": request, "message": "Login successful"})
+    response.set_cookie(key="access_token", value=access_token, httponly=True)
+    return response
+
 @app.post("/token", response_model=Token)
-async def login(form_data: OAuth2PasswordRequestForm = Depends()):
+async def token(form_data: OAuth2PasswordRequestForm = Depends()):
     user = users_db.get(form_data.username)
     if not user or not verify_password(form_data.password, user["password"]):
         raise HTTPException(status_code=401, detail="Incorrect email or password")
@@ -678,7 +716,7 @@ async def login(form_data: OAuth2PasswordRequestForm = Depends()):
     return {"access_token": access_token, "token_type": "bearer"}
 
 @app.post("/analyze", response_class=HTMLResponse)
-async def analyze_code(request: Request, code: str = Form(..., max_length=100_000), handle: str = Form(...), language: str = Form(...), current_user: Dict[str, Any] = Depends(get_current_user)):
+async def analyze_code(request: Request, code: str = Form(..., max_length=100_000), handle: str = Form(...), language: str = Form(...), current_user: Dict[str, Any] = Depends(get_current_user_from_cookie)):
     try:
         if is_ip_banned(request.client.host):
             raise HTTPException(status_code=403, detail="IP banned")
@@ -700,10 +738,10 @@ async def analyze_code(request: Request, code: str = Form(..., max_length=100_00
         response_data = {"result": {"handle": handle, "report": report, "confidence": analysis["confidence"], "label": analysis["label"]}}
         log_interaction(request, response_data, {"code": code, "handle": handle, "language": language})
         await train_lstm_model()
-        return templates.TemplateResponse("index.html", {"request": request, "result": response_data["result"]})
+        return templates.TemplateResponse("analyze.html", {"request": request, "result": response_data["result"]})
     except Exception as e:
         log_interaction(request, {"error": str(e)}, {"code": code, "handle": handle, "language": language})
-        raise HTTPException(status_code=500, detail=str(e))
+        return templates.TemplateResponse("analyze.html", {"request": request, "error": str(e)})
 
 @app.post("/check_plagiarism")
 async def check_plagiarism(code_input: CodeInput, current_user: Dict[str, Any] = Depends(get_current_user)):
@@ -761,11 +799,11 @@ async def prepare_submission(request: Request, code: str = Form(...), handle: st
     try:
         if is_ip_banned(request.client.host):
             raise HTTPException(status_code=403, detail="IP banned")
-        CodeInput(code=code, handle=handle, language="cpp")  # Default to cpp for prepare
+        CodeInput(code=code, handle=handle, language="cpp")
         process_code_submission(code, handle)
         response_data = {"message": f"Code for {handle} prepared"}
         log_interaction(request, response_data, {"code": code, "handle": handle})
-        return templates.TemplateResponse("index.html", {"request": request, "message": response_data["message"]})
+        return templates.TemplateResponse("analyze.html", {"request": request, "message": response_data["message"]})
     except Exception as e:
         log_interaction(request, {"error": str(e)}, {"code": code, "handle": handle})
         raise HTTPException(status_code=500, detail=str(e))
