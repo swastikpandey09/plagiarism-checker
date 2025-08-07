@@ -1,7 +1,6 @@
 from fastapi import FastAPI, Form, Request, HTTPException, Depends
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
-from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr, field_validator
 from passlib.context import CryptContext
@@ -12,8 +11,6 @@ import json
 import re
 import hashlib
 import asyncpg
-from fastapi_limiter import FastAPILimiter
-import redis.asyncio as redis
 from openai import AsyncOpenAI, APIError
 from typing import Dict, List, Optional
 import ast
@@ -24,6 +21,8 @@ from os import environ, getenv
 from dotenv import load_dotenv
 from pathlib import Path
 import tempfile
+from fastapi_limiter import FastAPILimiter
+import redis.asyncio as redis
 
 # Logging setup
 class JSONFormatter(logging.Formatter):
@@ -50,13 +49,20 @@ logging.basicConfig(level=getattr(logging, log_level if log_level in valid_log_l
 load_dotenv()
 OPENROUTER_API_KEY = getenv("OPENROUTER_API_KEY")
 SECRET_KEY = getenv("SECRET_KEY")
-DB_URL = getenv("DATABASE_URL", "postgresql://user:password@localhost:5432/plagiarism_detector")
+DB_URL = getenv("DATABASE_URL")  # Railway provides this
+REDIS_URL = getenv("REDIS_URL")  # Railway provides this
 if not OPENROUTER_API_KEY or not OPENROUTER_API_KEY.startswith("sk-or-v1-"):
     logger.error("Invalid OPENROUTER_API_KEY")
     raise RuntimeError("Invalid OPENROUTER_API_KEY")
 if not SECRET_KEY:
     logger.error("Missing SECRET_KEY")
     raise RuntimeError("Missing SECRET_KEY")
+if not DB_URL:
+    logger.error("Missing DATABASE_URL")
+    raise RuntimeError("Missing DATABASE_URL")
+if not REDIS_URL:
+    logger.error("Missing REDIS_URL")
+    raise RuntimeError("Missing REDIS_URL")
 masked_key = f"{OPENROUTER_API_KEY[:10]}...{OPENROUTER_API_KEY[-4:]}" if OPENROUTER_API_KEY else "None"
 logger.info(f"Loaded OPENROUTER_API_KEY: {masked_key}")
 
@@ -71,8 +77,6 @@ app.add_middleware(
 )
 BASE_DIR = Path(__file__).resolve().parent
 TEMPLATES_DIR = BASE_DIR / "templates"
-STATIC_DIR = BASE_DIR / "static"
-app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 templates = Jinja2Templates(directory=TEMPLATES_DIR)
 
 # Configuration
@@ -192,6 +196,8 @@ async def init_db():
     await conn.close()
 
 # Helper functions
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
 def verify_password(plain_password: str, hashed_password: str) -> bool:
     return pwd_context.verify(plain_password, hashed_password)
 
@@ -566,7 +572,7 @@ async def detect_plagiarism(code: str, handle: str, language: str) -> Dict[str, 
                     compute_global_distance(string_to_matrix(pad_string(cleaned_generated))))
         jaccard = jaccard_similarity(cleaned_code, cleaned_generated)
         cosine = cosine_similarity(cleaned_code, cleaned_generated)
-        winnowing = winnowing_hash_similarity(cleaned_code, cleaned_generated)
+        winnowing = winnowing_hash_similarity(cleaned_code, generated_code)
         is_plagiarized = (lcs_ratio >= CONFIG["plagiarism_threshold"] or 
                          ast_sim >= CONFIG["ast_similarity_threshold"] or 
                          delta < CONFIG["delta_threshold"] or
@@ -617,7 +623,7 @@ async def log_interaction(request: Request, response: Dict[str, Any], input_data
 @app.on_event("startup")
 async def startup():
     await init_db()
-    redis_client = redis.from_url("redis://localhost:6379")
+    redis_client = redis.from_url(REDIS_URL)
     await FastAPILimiter.init(redis_client)
     logger.info("Application started")
 
@@ -678,7 +684,7 @@ async def login(email: str = Form(...), password: str = Form(...), request: Requ
             value=access_token,
             httponly=True,
             samesite="lax",
-            secure=False  # Set to True in production
+            secure=True
         )
         logger.info(f"User {user['handle']} logged in")
         await log_interaction(request, {"message": f"User {user['handle']} logged in"}, {"email": email})
@@ -721,13 +727,13 @@ async def analyze_code(
         conn = await asyncpg.connect(DB_URL)
         await conn.execute(
             "INSERT INTO submissions (user_id, problem_id, code, language) VALUES ((SELECT id FROM users WHERE handle = $1), $2, $3, $4)",
-            handle, 1, code, language  # problem_id is placeholder
+            handle, 1, code, language
         )
         await conn.close()
         report = f"Plagiarism Report for {handle}\n\n" \
                  f"AI/Human Classification: {analysis['label']} (Confidence: {analysis['confidence']:.2%})\n" \
                  f"Plagiarism Check: {'Detected' if plagiarism['is_plagiarized'] else 'Not detected'}\n" \
-                 f"Evidence:\n" + ("\n".join([f"- {x}" for x in plagiarism["evidence"]]) if plagiarism["evidence"] else "- None\n")
+                 f"Evidence:\n" + ("\n".join([f"- {x}" for x in plagiarism['evidence']]) if plagiarism['evidence'] else "- None\n")
         if issues:
             report += "Issues:\n" + "\n".join([f"- {x}" for x in issues]) + "\n"
         flags = sum(1 for x in [
@@ -768,7 +774,7 @@ async def analyze_code_form(request: Request, code: str = Form(..., max_length=1
         report = f"Plagiarism Report for {handle}\n\n" \
                  f"AI/Human Classification: {analysis['label']} (Confidence: {analysis['confidence']:.2%})\n" \
                  f"Plagiarism Check: {'Detected' if plagiarism['is_plagiarized'] else 'Not detected'}\n" \
-                 f"Evidence:\n" + ("\n".join([f"- {x}" for x in plagiarism["evidence"]]) if plagiarism["evidence"] else "- None\n")
+                 f"Evidence:\n" + ("\n".join([f"- {x}" for x in plagiarism['evidence']]) if plagiarism['evidence'] else "- None\n")
         if issues:
             report += "Issues:\n" + "\n".join([f"- {x}" for x in issues]) + "\n"
         flags = sum(1 for x in [
