@@ -668,7 +668,7 @@ async def register(email1: str = Form(...), email2: str = Form(...), password: s
         return JSONResponse(status_code=400, content={"error": str(e)})
 
 @app.post("/login", response_class=JSONResponse)
-async def login(email: str = Form(...), password: str = Form(...), request: Request):
+async def login(request: Request, email: str = Form(...), password: str = Form(...)):
     try:
         if await is_banned(request.client.host, email):
             return JSONResponse(status_code=403, content={"error": "IP or email banned"})
