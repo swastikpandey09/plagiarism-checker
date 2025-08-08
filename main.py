@@ -696,10 +696,10 @@ async def login(request: Request, email: str = Form(...), password: str = Form(.
 
 @app.post("/analyze", response_class=JSONResponse)
 async def analyze_code(
+    request: Request,
     code: str = Form(..., max_length=100_000),
     handle: str = Form(...),
     language: str = Form(...),
-    request: Request,
     current_user: Dict = Depends(get_current_user)
 ):
     try:
@@ -752,7 +752,6 @@ async def analyze_code(
         logger.error(f"Analyze error: {e}")
         await log_interaction(request, {"error": str(e)}, {"code": code, "handle": handle, "language": language})
         return JSONResponse(status_code=400, content={"error": str(e)})
-
 @app.post("/a", response_class=HTMLResponse)
 async def analyze_code_form(request: Request, code: str = Form(..., max_length=100_000), handle: str = Form("triumph")):
     try:
