@@ -5,8 +5,8 @@
     "env": {
       "PYTHON_VERSION": "3.10"
     }
-    "deploy": {
-      "startCommand": "hypercorn main:app --bind \"[::]:$PORT\""
-  }
+  },
+  "deploy": {
+    "startCommand": "hypercorn main:app --bind \"[::]:$PORT\""
   }
 }
