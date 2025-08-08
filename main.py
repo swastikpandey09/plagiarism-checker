@@ -7,6 +7,7 @@ from passlib.context import CryptContext
 from jose import jwt, JWTError
 from datetime import datetime, timedelta
 import logging
+from typing import Any, Dict
 '''
 you just now blackmailed me in light way, so i decided to write this to you
 
