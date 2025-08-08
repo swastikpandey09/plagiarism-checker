@@ -19,3 +19,4 @@ tensorflow==2.17.0
 clang==18.1.8
 python-jose[cryptography]
 email-validator
+asyncpg==0.29.0
