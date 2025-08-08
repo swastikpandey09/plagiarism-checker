@@ -7,6 +7,19 @@ from passlib.context import CryptContext
 from jose import jwt, JWTError
 from datetime import datetime, timedelta
 import logging
+'''
+you just now blackmailed me in light way, so i decided to write this to you
+
+my English is something you dont want to hear so i used chatgpt to correct my grammar
+"
+the video you saw was something I clicked on because I had a private concern and fear of a physical thing happening to me that isn't mentioned in our book I didn’t feel comfortable talking about with anyone yet. Before saying anything to anyone, I wanted to check online and see if it was something serious or not. That’s literally it. There’s nothing weird or shameful about it — I was trying to be responsible in my own way. So if you’re thinking of blackmailing or teasing me with it, that’s pretty low, and it’s not going to work."
+
+one more thing
+
+"you have screenshotted 2 videos, one was played for 28 minutes straight just to find out if my syptoms were any of these, and second one played for 1 second because it played automatically after the end of first video, so it is clear itself that i didn't watched it"
+
+one more thing: good luck trying to find ways to destroy me
+'''
 import json
 import re
 import hashlib
