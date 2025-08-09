@@ -545,12 +545,14 @@ async def classify_code(code: str, handle: str) -> Dict[str, Any]:
     confidence = min(0.99, 1.0 / (1.0 + math.exp(-0.05 * (threshold - deviation))))
     label = "Human" if deviation < threshold else "AI"
     return {"success": True, "label": label, "confidence": confidence, "handle": handle}
+# ... (previous code until compare_with_previous_submission)
 
 async def compare_with_previous_submission(code: str, handle: str, language: str) -> Dict[str, Any]:
     try:
         conn = await asyncpg.connect(DB_URL)
         user = await conn.fetchrow("SELECT id FROM users WHERE handle = $1", handle)
         if not user:
+            await conn.close()
             return {"is_suspicious": False, "details": "User not found"}
         submissions = await conn.fetch(
             "SELECT code FROM submissions WHERE user_id = $1 AND language = $2 ORDER BY submitted_at DESC LIMIT 3",
@@ -560,18 +562,33 @@ async def compare_with_previous_submission(code: str, handle: str, language: str
         if not submissions:
             return {"is_suspicious": False, "details": "No previous submissions"}
         cleaned_current = clean_code(code)
+        details = []
         for sub in submissions:
             cleaned_previous = clean_code(sub["code"])
+            # LCS similarity
             lcs_score = lcs_length(cleaned_current, cleaned_previous)
             lcs_ratio = lcs_score / max(len(cleaned_current), len(cleaned_previous)) if cleaned_current and cleaned_previous else 0
+            # Grid-based similarity
+            current_matrix = string_to_matrix(pad_string(cleaned_current))
+            previous_matrix = string_to_matrix(pad_string(cleaned_previous))
+            delta = abs(compute_global_distance(current_matrix) - compute_global_distance(previous_matrix))
+            grid_similarity = 1.0 / (1.0 + delta) if delta is not None else 0.0  # Convert distance to similarity (0 to 1)
+            # AST similarity
             ast_sim = cpp_ast_similarity(code, sub["code"]) if language == "cpp" else python_ast_similarity(code, sub["code"])
-            if lcs_ratio >= CONFIG["lcs_threshold"] or ast_sim >= CONFIG["ast_similarity_threshold"]:
-                return {"is_suspicious": True, "details": f"Similar to previous submission: LCS {lcs_ratio:.2f}, AST {ast_sim:.2f}"}
-        return {"is_suspicious": False, "details": "No suspicious similarity"}
+            # Combined similarity (weighted average: 40% LCS, 40% Grid, 20% AST)
+            combined_similarity = (0.4 * lcs_ratio + 0.4 * grid_similarity + 0.2 * ast_sim)
+            details.append(f"LCS: {lcs_ratio:.2f}, Grid: {grid_similarity:.2f}, AST: {ast_sim:.2f}, Combined: {combined_similarity:.2f}")
+            if combined_similarity >= CONFIG["plagiarism_threshold"]:
+                return {
+                    "is_suspicious": True,
+                    "details": f"Similar to previous submission: {details[-1]}"
+                }
+        return {"is_suspicious": False, "details": "; ".join(details) if details else "No similarity checks performed"}
     except Exception as e:
         logger.error(f"Error comparing with previous submissions: {e}")
         return {"is_suspicious": False, "details": str(e)}
 
+# ... (rest of the code remains unchanged)
 async def detect_plagiarism(code: str, handle: str, language: str) -> Dict[str, Any]:
     if not code:
         return {"is_plagiarized": False, "details": "Empty code", "status": "N", "evidence": ["Empty code"]}
