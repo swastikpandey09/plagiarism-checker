@@ -694,7 +694,8 @@ async def startup():
 async def get_login(request: Request):
     if await is_banned(request.client.host, ""):
         raise HTTPException(status_code=403, detail="IP banned")
-    return most_common_words(request)
+    return templates.TemplateResponse("login.html", {"request": request})
+
 
 @app.post("/register", response_class=JSONResponse)
 async def register(email1: str = Form(...), email2: str = Form(...), password: str = Form(...), handle: str = Form(...)):
