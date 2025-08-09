@@ -546,7 +546,6 @@ async def classify_code(code: str, handle: str) -> Dict[str, Any]:
     label = "Human" if deviation < threshold else "AI"
     return {"success": True, "label": label, "confidence": confidence, "handle": handle}
 # ... (previous code until compare_with_previous_submission)
-
 async def compare_with_previous_submission(code: str, handle: str, language: str) -> Dict[str, Any]:
     try:
         conn = await asyncpg.connect(DB_URL)
@@ -587,7 +586,6 @@ async def compare_with_previous_submission(code: str, handle: str, language: str
     except Exception as e:
         logger.error(f"Error comparing with previous submissions: {e}")
         return {"is_suspicious": False, "details": str(e)}
-
 # ... (rest of the code remains unchanged)
 async def detect_plagiarism(code: str, handle: str, language: str) -> Dict[str, Any]:
     if not code:
