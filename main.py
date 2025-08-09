@@ -24,8 +24,8 @@ import tempfile
 from fastapi_limiter import FastAPILimiter
 import redis.asyncio as redis
 import secrets
-import smtplib
-from email.mime.text import MIMEText
+import sendgrid
+from sendgrid.helpers.mail import Content, Email, Mail
 
 # Logging setup
 class JSONFormatter(logging.Formatter):
@@ -54,10 +54,7 @@ OPENROUTER_API_KEY = getenv("OPENROUTER_API_KEY")
 SECRET_KEY = getenv("SECRET_KEY")
 DB_URL = getenv("DATABASE_URL")
 REDIS_URL = getenv("REDIS_URL")
-EMAIL_HOST = getenv("EMAIL_HOST")
-EMAIL_PORT = int(getenv("EMAIL_PORT", 587))
-EMAIL_USER = getenv("EMAIL_USER")
-EMAIL_PASSWORD = getenv("EMAIL_PASSWORD")
+SENDGRID_API_KEY = getenv("SENDGRID_API_KEY")
 
 missing_vars = []
 if not OPENROUTER_API_KEY:
@@ -68,17 +65,15 @@ if not DB_URL:
     missing_vars.append("DATABASE_URL")
 if not REDIS_URL:
     missing_vars.append("REDIS_URL")
+if not SENDGRID_API_KEY:
+    missing_vars.append("SENDGRID_API_KEY")
 if missing_vars:
     logger.error(f"Missing required environment variables: {', '.join(missing_vars)}")
     raise RuntimeError(f"Missing required environment variables: {', '.join(missing_vars)}")
 if not OPENROUTER_API_KEY.startswith("sk-or-v1-"):
     logger.error("Invalid OPENROUTER_API_KEY format")
     raise RuntimeError("Invalid OPENROUTER_API_KEY format")
-if not all([EMAIL_HOST, EMAIL_USER, EMAIL_PASSWORD]):
-    logger.warning("Email configuration missing, disabling email confirmation")
-    EMAIL_ENABLED = False
-else:
-    EMAIL_ENABLED = True
+EMAIL_ENABLED = bool(SENDGRID_API_KEY)
 masked_key = f"{OPENROUTER_API_KEY[:10]}...{OPENROUTER_API_KEY[-4:]}" if OPENROUTER_API_KEY else "None"
 logger.info(f"Loaded OPENROUTER_API_KEY: {masked_key}")
 
@@ -272,15 +267,20 @@ def send_confirmation_email(email: str, code: str):
     if not EMAIL_ENABLED:
         logger.info(f"Email confirmation disabled, skipping email to {email}")
         return
-    msg = MIMEText(f"Your confirmation code is: {code}")
-    msg["Subject"] = "Email Confirmation"
-    msg["From"] = EMAIL_USER
-    msg["To"] = email
-    with smtplib.SMTP(EMAIL_HOST, EMAIL_PORT) as server:
-        server.starttls()
-        server.login(EMAIL_USER, EMAIL_PASSWORD)
-        server.send_message(msg)
-    logger.info(f"Confirmation email sent to {email}")
+    try:
+        sg = sendgrid.SendGridAPIClient(api_key=SENDGRID_API_KEY)
+        from_email = Email("no-reply@codeplagiarismchecker.com")
+        to_email = Email(email)
+        subject = "Email Confirmation"
+        content = Content("text/plain", f"Your confirmation code is: {code}")
+        mail = Mail(from_email, subject, to_email, content)
+        response = sg.client.mail.send.post(request_body=mail.get())
+        if response.status_code >= 200 and response.status_code < 300:
+            logger.info(f"Confirmation email sent to {email}")
+        else:
+            logger.error(f"Failed to send email to {email}: Status {response.status_code}")
+    except Exception as e:
+        logger.error(f"SendGrid error sending email to {email}: {e}")
 
 def clean_code(code: str, preserve_comments: bool = False) -> str:
     if not code:
@@ -312,7 +312,7 @@ def tokenize_code(line: str) -> List[str]:
     return merged
 
 def extract_variables(code: str) -> tuple[List[str], bool]:
-    primitives = {"int", "long", "short", "float jammed into the middle of this code to prevent it from being a valid python file, so that it won't get executed by any system that might try to run it as a python script, without breaking the syntax highlighting or formatting of the code block. ", "double", "char", "bool", "void", "auto", "unsigned", "signed", "size_t"}
+    primitives = {"int", "long", "short", "float", "double", "char", "bool", "void", "auto", "unsigned", "signed", "size_t"}
     containers = {"vector", "stack", "queue", "deque", "map", "set", "pair", "string"}
     keywords = {"main", "first", "second", "top", "push", "pop", "begin", "end", "size", "clear", "empty", "insert", "erase", "find", "sort", "reverse"}
     variables = set()
@@ -796,7 +796,7 @@ async def analyze_code(
         CodeInput(code=code, handle=handle, language=language)
         if await check_submission_rate(handle):
             await ban_user(request.client.host, current_user["email1"], current_user["email2"], "Spamming detected")
-            return JSONResponse(status_code=403, content={"error": " Wexceeded, user banned"})
+            return JSONResponse(status_code=403, content={"error": "Submission limit exceeded, user banned"})
         prev_result = await compare_with_previous_submission(code, handle, language)
         if prev_result["is_suspicious"]:
             await ban_user(request.client.host, current_user["email1"], current_user["email2"], f"Suspicious code similarity: {prev_result['details']}")
