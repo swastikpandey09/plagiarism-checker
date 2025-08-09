@@ -47,6 +47,7 @@ logger.handlers = [handler]
 log_level = environ.get("LOG_LEVEL", "INFO").upper()
 valid_log_levels = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
 logging.basicConfig(level=getattr(logging, log_level if log_level in valid_log_levels else "INFO"))
+# ... (previous code until environment variables section)
 
 # Load environment variables
 load_dotenv()
@@ -58,12 +59,32 @@ EMAIL_HOST = getenv("EMAIL_HOST")
 EMAIL_PORT = int(getenv("EMAIL_PORT", 587))
 EMAIL_USER = getenv("EMAIL_USER")
 EMAIL_PASSWORD = getenv("EMAIL_PASSWORD")
-if not all([OPENROUTER_API_KEY, SECRET_KEY, DB_URL, REDIS_URL, EMAIL_HOST, EMAIL_PORT, EMAIL_USER, EMAIL_PASSWORD]):
-    logger.error("Missing required environment variables")
-    raise RuntimeError("Missing required environment variables")
+
+missing_vars = []
+if not OPENROUTER_API_KEY:
+    missing_vars.append("OPENROUTER_API_KEY")
+if not SECRET_KEY:
+    missing_vars.append("SECRET_KEY")
+if not DB_URL:
+    missing_vars.append("DATABASE_URL")
+if not REDIS_URL:
+    missing_vars.append("REDIS_URL")
+if not EMAIL_HOST:
+    missing_vars.append("EMAIL_HOST")
+if not EMAIL_USER:
+    missing_vars.append("EMAIL_USER")
+if not EMAIL_PASSWORD:
+    missing_vars.append("EMAIL_PASSWORD")
+if missing_vars:
+    logger.error(f"Missing required environment variables: {', '.join(missing_vars)}")
+    raise RuntimeError(f"Missing required environment variables: {', '.join(missing_vars)}")
+if not OPENROUTER_API_KEY.startswith("sk-or-v1-"):
+    logger.error("Invalid OPENROUTER_API_KEY format")
+    raise RuntimeError("Invalid OPENROUTER_API_KEY format")
 masked_key = f"{OPENROUTER_API_KEY[:10]}...{OPENROUTER_API_KEY[-4:]}" if OPENROUTER_API_KEY else "None"
 logger.info(f"Loaded OPENROUTER_API_KEY: {masked_key}")
 
+# ... (rest of the code remains unchanged)
 # FastAPI setup
 app = FastAPI(title="AtCoder Plagiarism Detector", version="1.0.0")
 app.add_middleware(
