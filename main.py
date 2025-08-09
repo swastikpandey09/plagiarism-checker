@@ -741,6 +741,7 @@ async def login(request: Request, email: str = Form(...), password: str = Form(.
         logger.error(f"Login error: {e}")
         await log_interaction(request, {"error": str(e)}, {"email": email})
         return JSONResponse(status_code=500, content={"error": str(e)})
+# ... (previous code remains unchanged until the /analyze endpoint)
 
 @app.post("/analyze", response_class=JSONResponse)
 async def analyze_code(
@@ -790,7 +791,7 @@ async def analyze_code(
             has_long_vars,
             has_suspicious_comments(code)
         ] if x)
-        verdict = "Plagiarized" if flags >= 2 else "Human        
+        verdict = "Plagiarized" if flags >= 2 else "Human-written"
         report += f"Verdict: {verdict}\n"
         response_data = {"result": {"handle": handle, "report": report, "confidence": analysis["confidence"], "label": analysis["label"]}}
         await log_interaction(request, response_data, {"code": code, "handle": handle, "language": language})
@@ -801,6 +802,7 @@ async def analyze_code(
         await log_interaction(request, {"error": str(e)}, {"code": code, "handle": handle, "language": language})
         return JSONResponse(status_code=400, content={"error": str(e)})
 
+# ... (rest of the code remains unchanged)
 @app.post("/a", response_class=HTMLResponse)
 async def analyze_code_form(request: Request, code: str = Form(..., max_length=100_000), handle: str = Form("triumph")):
     try:
