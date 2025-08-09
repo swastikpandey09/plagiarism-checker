@@ -720,11 +720,14 @@ async def register(email1: str = Form(...), email2: str = Form(...), password: s
         if EMAIL_ENABLED:
             send_confirmation_email(email1, confirmation_code)
             logger.info(f"User {handle} registered, confirmation email sent to {email1}")
+            await log_interaction(None, {"message": f"User {handle} registered"}, {"email1": email1, "handle": handle})
             return JSONResponse(content={"message": "Registration successful, please confirm your email"})
         logger.info(f"User {handle} registered, email confirmation disabled")
+        await log_interaction(None, {"message": f"User {handle} registered"}, {"email1": email1, "handle": handle})
         return JSONResponse(content={"message": "Registration successful"})
     except Exception as e:
         logger.error(f"Registration error: {e}")
+        await log_interaction(None, {"error": str(e)}, {"email1": email1, "handle": handle})
         return JSONResponse(status_code=400, content={"error": str(e)})
 
 @app.post("/confirm-email", response_class=JSONResponse)
@@ -773,6 +776,7 @@ async def login(request: Request, email: str = Form(...), password: str = Form(.
         return response
     except Exception as e:
         logger.error(f"Login error: {e}")
+        await log_interaction(request, {"error": str(e)}, {"email": email})
         return JSONResponse(status_code=500, content={"error": str(e)})
 
 @app.post("/analyze", response_class=JSONResponse)
