@@ -7,26 +7,12 @@ from passlib.context import CryptContext
 from jose import jwt, JWTError
 from datetime import datetime, timedelta
 import logging
-from typing import Any, Dict
-'''
-you just now blackmailed me in light way, so i decided to write this to you
-
-my English is something you dont want to hear so i used chatgpt to correct my grammar
-"
-the video you saw was something I clicked on because I had a private concern and fear of a physical thing happening to me that isn't mentioned in our book I didn’t feel comfortable talking about with anyone yet. Before saying anything to anyone, I wanted to check online and see if it was something serious or not. That’s literally it. There’s nothing weird or shameful about it — I was trying to be responsible in my own way. So if you’re thinking of blackmailing or teasing me with it, that’s pretty low, and it’s not going to work."
-
-one more thing
-
-"you have screenshotted 2 videos, one was played for 28 minutes straight just to find out if my syptoms were any of these, and second one played for 1 second because it played automatically after the end of first video, so it is clear itself that i didn't watched it"
-
-one more thing: good luck trying to find ways to destroy me
-'''
+from typing import Any, Dict, Optional
 import json
 import re
 import hashlib
 import asyncpg
 from openai import AsyncOpenAI, APIError
-from typing import Dict, List, Optional
 import ast
 import clang.cindex as clang
 from collections import Counter
@@ -37,6 +23,9 @@ from pathlib import Path
 import tempfile
 from fastapi_limiter import FastAPILimiter
 import redis.asyncio as redis
+import secrets
+import smtplib
+from email.mime.text import MIMEText
 
 # Logging setup
 class JSONFormatter(logging.Formatter):
@@ -63,20 +52,15 @@ logging.basicConfig(level=getattr(logging, log_level if log_level in valid_log_l
 load_dotenv()
 OPENROUTER_API_KEY = getenv("OPENROUTER_API_KEY")
 SECRET_KEY = getenv("SECRET_KEY")
-DB_URL = getenv("DATABASE_URL")  # Railway provides this
-REDIS_URL = getenv("REDIS_URL")  # Railway provides this
-if not OPENROUTER_API_KEY or not OPENROUTER_API_KEY.startswith("sk-or-v1-"):
-    logger.error("Invalid OPENROUTER_API_KEY")
-    raise RuntimeError("Invalid OPENROUTER_API_KEY")
-if not SECRET_KEY:
-    logger.error("Missing SECRET_KEY")
-    raise RuntimeError("Missing SECRET_KEY")
-if not DB_URL:
-    logger.error("Missing DATABASE_URL")
-    raise RuntimeError("Missing DATABASE_URL")
-if not REDIS_URL:
-    logger.error("Missing REDIS_URL")
-    raise RuntimeError("Missing REDIS_URL")
+DB_URL = getenv("DATABASE_URL")
+REDIS_URL = getenv("REDIS_URL")
+EMAIL_HOST = getenv("EMAIL_HOST")
+EMAIL_PORT = int(getenv("EMAIL_PORT", 587))
+EMAIL_USER = getenv("EMAIL_USER")
+EMAIL_PASSWORD = getenv("EMAIL_PASSWORD")
+if not all([OPENROUTER_API_KEY, SECRET_KEY, DB_URL, REDIS_URL, EMAIL_HOST, EMAIL_PORT, EMAIL_USER, EMAIL_PASSWORD]):
+    logger.error("Missing required environment variables")
+    raise RuntimeError("Missing required environment variables")
 masked_key = f"{OPENROUTER_API_KEY[:10]}...{OPENROUTER_API_KEY[-4:]}" if OPENROUTER_API_KEY else "None"
 logger.info(f"Loaded OPENROUTER_API_KEY: {masked_key}")
 
@@ -171,6 +155,10 @@ class SingleCodeInput(BaseModel):
             raise ValueError("Handle must be alphanumeric or underscores")
         return v
 
+class EmailConfirm(BaseModel):
+    email: EmailStr
+    code: str
+
 # Database setup
 async def init_db():
     conn = await asyncpg.connect(DB_URL)
@@ -182,6 +170,8 @@ async def init_db():
             password_hash TEXT NOT NULL,
             handle TEXT UNIQUE NOT NULL,
             is_banned BOOLEAN DEFAULT FALSE,
+            is_confirmed BOOLEAN DEFAULT FALSE,
+            confirmation_code TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
         CREATE TABLE IF NOT EXISTS submissions (
@@ -236,8 +226,8 @@ async def get_current_user(request: Request):
         conn = await asyncpg.connect(DB_URL)
         user = await conn.fetchrow("SELECT * FROM users WHERE email1 = $1 OR email2 = $1", email)
         await conn.close()
-        if not user or user["is_banned"]:
-            raise HTTPException(status_code=401, detail="Invalid or banned user")
+        if not user or user["is_banned"] or not user["is_confirmed"]:
+            raise HTTPException(status_code=401, detail="Invalid, banned, or unconfirmed user")
         return user
     except JWTError:
         raise HTTPException(status_code=401, detail="Invalid credentials")
@@ -258,6 +248,17 @@ async def ban_user(ip: str, email1: str, email2: str, reason: str):
     await conn.close()
     logger.info(f"Banned IP: {ip}, Emails: {email1}, {email2}, Reason: {reason}")
 
+def send_confirmation_email(email: str, code: str):
+    msg = MIMEText(f"Your confirmation code is: {code}")
+    msg["Subject"] = "Email Confirmation"
+    msg["From"] = EMAIL_USER
+    msg["To"] = email
+    with smtplib.SMTP(EMAIL_HOST, EMAIL_PORT) as server:
+        server.starttls()
+        server.login(EMAIL_USER, EMAIL_PASSWORD)
+        server.send_message(msg)
+    logger.info(f"Confirmation email sent to {email}")
+
 def clean_code(code: str, preserve_comments: bool = False) -> str:
     if not code:
         return ""
@@ -266,7 +267,7 @@ def clean_code(code: str, preserve_comments: bool = False) -> str:
         code = re.sub(r'/\*.*?\*/', '', code, flags=re.DOTALL)
     return re.sub(r'\s+', ' ', code).strip()
 
-def tokenize_code(line: str) -> List[str]:
+def tokenize_code(line: str) -> list[str]:
     if not line:
         return []
     line = re.sub(r'//.*$', '', line)
@@ -287,7 +288,7 @@ def tokenize_code(line: str) -> List[str]:
             i += 1
     return merged
 
-def extract_variables(code: str) -> tuple[List[str], bool]:
+def extract_variables(code: str) -> tuple[list[str], bool]:
     primitives = {"int", "long", "short", "float", "double", "char", "bool", "void", "auto", "unsigned", "signed", "size_t"}
     containers = {"vector", "stack", "queue", "deque", "map", "set", "pair", "string"}
     keywords = {"main", "first", "second", "top", "push", "pop", "begin", "end", "size", "clear", "empty", "insert", "erase", "find", "sort", "reverse"}
@@ -313,7 +314,7 @@ def extract_variables(code: str) -> tuple[List[str], bool]:
     has_long_vars = len([v for v in var_list if len(v) > CONFIG["var_length"]]) >= 2
     return var_list, has_long_vars
 
-def parse_type(tokens: List[str], index: int, primitives: set, containers: set) -> tuple[str, int]:
+def parse_type(tokens: list[str], index: int, primitives: set, containers: set) -> tuple[str, int]:
     type_str = ""
     while index < len(tokens) and (tokens[index] in primitives or tokens[index] in containers):
         type_str += tokens[index] + " "
@@ -378,8 +379,13 @@ def cpp_ast_similarity(code1: str, code2: str) -> float:
             index = clang.Index.create()
             tu = index.parse(temp_file_path, args=['-std=c++17'])
             Path(temp_file_path).unlink()
-            return tu.cursor if not tu.diagnostics else None
-        except Exception:
+            if tu.diagnostics:
+                for diag in tu.diagnostics:
+                    logger.error(f"Clang diagnostic: {diag}")
+                return None
+            return tu.cursor
+        except Exception as e:
+            logger.error(f"Failed to parse C++ code: {e}")
             return None
     ast1, ast2 = parse_code_to_ast(code1), parse_code_to_ast(code2)
     if not ast1 or not ast2:
@@ -445,7 +451,7 @@ def winnowing_hash_similarity(text1: str, text2: str, k: int = 5, w: int = 10) -
     union = len(fingerprints1.union(fingerprints2))
     return intersection / union if union > 0 else 0.0
 
-def compute_hash(text: str, by_line: bool = True) -> List[int]:
+def compute_hash(text: str, by_line: bool = True) -> list[int]:
     if not text:
         return []
     segments = text.splitlines() if by_line else [text]
@@ -467,13 +473,13 @@ def pad_string(text: str) -> str:
         padded_lines.extend(['S' * max_len for _ in range(max_len - len(padded_lines))])
     return '\n'.join(padded_lines)
 
-def string_to_matrix(text: str, max_lines: int = 1000) -> List[List[int]]:
+def string_to_matrix(text: str, max_lines: int = 1000) -> list[list[int]]:
     if not text:
         return []
     lines = text.splitlines()[:max_lines]
     return [[ord(char) % 128 for char in line] for line in lines if line]
 
-def extract_submatrix(matrix: List[List[int]], center: List[int], size: int = 3) -> List[List[int]]:
+def extract_submatrix(matrix: list[list[int]], center: list[int], size: int = 3) -> list[list[int]]:
     if not matrix or not matrix[0]:
         return []
     half_size = size // 2
@@ -484,7 +490,7 @@ def extract_submatrix(matrix: List[List[int]], center: List[int], size: int = 3)
     col_end = min(cols, center[1] + half_size + 1)
     return [[matrix[i][j] for j in range(col_start, col_end)] for i in range(row_start, row_end)]
 
-def matrix_avg_distance(matrix: List[List[int]]) -> float:
+def matrix_avg_distance(matrix: list[list[int]]) -> float:
     if not matrix or not matrix[0]:
         return 0.0
     rows, cols = len(matrix), len(matrix[0])
@@ -492,7 +498,7 @@ def matrix_avg_distance(matrix: List[List[int]]) -> float:
     total = sum((i - center_r) ** 2 + (j - center_c) ** 2 for i in range(rows) for j in range(cols))
     return total / (rows * cols) ** 0.5 if rows * cols > 0 else 0.0
 
-def compute_global_distance(matrix: List[List[int]]) -> float:
+def compute_global_distance(matrix: list[list[int]]) -> float:
     if not matrix or not matrix[0]:
         return 0.0
     rows, cols = len(matrix), len(matrix[0])
@@ -526,22 +532,23 @@ async def compare_with_previous_submission(code: str, handle: str, language: str
         if not user:
             return {"is_suspicious": False, "details": "User not found"}
         submissions = await conn.fetch(
-            "SELECT code FROM submissions WHERE user_id = $1 AND language = $2 ORDER BY submitted_at DESC LIMIT 1",
+            "SELECT code FROM submissions WHERE user_id = $1 AND language = $2 ORDER BY submitted_at DESC LIMIT 3",
             user["id"], language
         )
         await conn.close()
         if not submissions:
             return {"is_suspicious": False, "details": "No previous submissions"}
-        previous_code = submissions[0]["code"]
         cleaned_current = clean_code(code)
-        cleaned_previous = clean_code(previous_code)
-        lcs_score = lcs_length(cleaned_current, cleaned_previous)
-        lcs_ratio = lcs_score / max(len(cleaned_current), len(cleaned_previous)) if cleaned_current and cleaned_previous else 0
-        ast_sim = cpp_ast_similarity(code, previous_code) if language == "cpp" else python_ast_similarity(code, previous_code)
-        is_suspicious = lcs_ratio >= CONFIG["lcs_threshold"] or ast_sim >= CONFIG["ast_similarity_threshold"]
-        return {"is_suspicious": is_suspicious, "details": f"LCS: {lcs_ratio:.2f}, AST: {ast_sim:.2f}"}
+        for sub in submissions:
+            cleaned_previous = clean_code(sub["code"])
+            lcs_score = lcs_length(cleaned_current, cleaned_previous)
+            lcs_ratio = lcs_score / max(len(cleaned_current), len(cleaned_previous)) if cleaned_current and cleaned_previous else 0
+            ast_sim = cpp_ast_similarity(code, sub["code"]) if language == "cpp" else python_ast_similarity(code, sub["code"])
+            if lcs_ratio >= CONFIG["lcs_threshold"] or ast_sim >= CONFIG["ast_similarity_threshold"]:
+                return {"is_suspicious": True, "details": f"Similar to previous submission: LCS {lcs_ratio:.2f}, AST {ast_sim:.2f}"}
+        return {"is_suspicious": False, "details": "No suspicious similarity"}
     except Exception as e:
-        logger.error(f"Error comparing with previous submission: {e}")
+        logger.error(f"Error comparing with previous submissions: {e}")
         return {"is_suspicious": False, "details": str(e)}
 
 async def detect_plagiarism(code: str, handle: str, language: str) -> Dict[str, Any]:
@@ -639,6 +646,11 @@ async def startup():
     await init_db()
     redis_client = redis.from_url(REDIS_URL)
     await FastAPILimiter.init(redis_client)
+    try:
+        clang.Index.create()
+        logger.info("Clang is available")
+    except Exception as e:
+        logger.error(f"Clang is not available: {e}")
     logger.info("Application started")
 
 # Endpoints
@@ -646,7 +658,7 @@ async def startup():
 async def get_login(request: Request):
     if await is_banned(request.client.host, ""):
         raise HTTPException(status_code=403, detail="IP banned")
-    return templates.TemplateResponse("login.html", {"request": request})
+    return most_common_words(request)
 
 @app.post("/register", response_class=JSONResponse)
 async def register(email1: str = Form(...), email2: str = Form(...), password: str = Form(...), handle: str = Form(...)):
@@ -668,17 +680,39 @@ async def register(email1: str = Form(...), email2: str = Form(...), password: s
             await conn.close()
             return JSONResponse(status_code=400, content={"error": "Email usage limit exceeded"})
         hashed_password = get_password_hash(password)
+        confirmation_code = secrets.token_hex(16)
         await conn.execute(
-            "INSERT INTO users (email1, email2, password_hash, handle) VALUES ($1, $2, $3, $4)",
-            email1, email2, hashed_password, handle
+            "INSERT INTO users (email1, email2, password_hash, handle, confirmation_code) VALUES ($1, $2, $3, $4, $5)",
+            email1, email2, hashed_password, handle, confirmation_code
         )
         await conn.close()
-        logger.info(f"User {handle} registered")
+        send_confirmation_email(email1, confirmation_code)
+        logger.info(f"User {handle} registered, confirmation email sent to {email1}")
         await log_interaction(None, {"message": f"User {handle} registered"}, {"email1": email1, "handle": handle})
-        return JSONResponse(content={"message": "Registration successful"})
+        return JSONResponse(content={"message": "Registration successful, please confirm your email"})
     except Exception as e:
         logger.error(f"Registration error: {e}")
         await log_interaction(None, {"error": str(e)}, {"email1": email1, "handle": handle})
+        return JSONResponse(status_code=400, content={"error": str(e)})
+
+@app.post("/confirm-email", response_class=JSONResponse)
+async def confirm_email(email: str = Form(...), code: str = Form(...)):
+    try:
+        EmailConfirm(email=email, code=code)
+        conn = await asyncpg.connect(DB_URL)
+        user = await conn.fetchrow("SELECT * FROM users WHERE email1 = $1 OR email2 = $1", email)
+        if not user:
+            await conn.close()
+            return JSONResponse(status_code=400, content={"error": "User not found"})
+        if user["confirmation_code"] != code:
+            await conn.close()
+            return JSONResponse(status_code=400, content={"error": "Invalid confirmation code"})
+        await conn.execute("UPDATE users SET is_confirmed = TRUE, confirmation_code = NULL WHERE email1 = $1 OR email2 = $1", email)
+        await conn.close()
+        logger.info(f"Email {email} confirmed")
+        return JSONResponse(content={"message": "Email confirmed successfully"})
+    except Exception as e:
+        logger.error(f"Email confirmation error: {e}")
         return JSONResponse(status_code=400, content={"error": str(e)})
 
 @app.post("/login", response_class=JSONResponse)
@@ -689,8 +723,8 @@ async def login(request: Request, email: str = Form(...), password: str = Form(.
         conn = await asyncpg.connect(DB_URL)
         user = await conn.fetchrow("SELECT * FROM users WHERE email1 = $1 OR email2 = $1", email)
         await conn.close()
-        if not user or not verify_password(password, user["password_hash"]):
-            return JSONResponse(status_code=401, content={"error": "Incorrect email or password"})
+        if not user or not verify_password(password, user["password_hash"]) or not user["is_confirmed"]:
+            return JSONResponse(status_code=401, content={"error": "Incorrect email/password or email not confirmed"})
         access_token = create_access_token(data={"sub": email})
         response = JSONResponse(content={"message": "Login successful", "access_token": access_token})
         response.set_cookie(
@@ -756,7 +790,7 @@ async def analyze_code(
             has_long_vars,
             has_suspicious_comments(code)
         ] if x)
-        verdict = "Plagiarized" if flags >= 2 else "Human-written"
+        verdict = "Plagiarized" if flags >= 2 else "Human        
         report += f"Verdict: {verdict}\n"
         response_data = {"result": {"handle": handle, "report": report, "confidence": analysis["confidence"], "label": analysis["label"]}}
         await log_interaction(request, response_data, {"code": code, "handle": handle, "language": language})
@@ -766,6 +800,7 @@ async def analyze_code(
         logger.error(f"Analyze error: {e}")
         await log_interaction(request, {"error": str(e)}, {"code": code, "handle": handle, "language": language})
         return JSONResponse(status_code=400, content={"error": str(e)})
+
 @app.post("/a", response_class=HTMLResponse)
 async def analyze_code_form(request: Request, code: str = Form(..., max_length=100_000), handle: str = Form("triumph")):
     try:
