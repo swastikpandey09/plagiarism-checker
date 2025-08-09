@@ -188,10 +188,12 @@ async def init_db():
             password_hash TEXT NOT NULL,
             handle TEXT UNIQUE NOT NULL,
             is_banned BOOLEAN DEFAULT FALSE,
-            is_confirmed BOOLEAN DEFAULT %s,
+            is_confirmed BOOLEAN DEFAULT FALSE,
             confirmation_code TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
+        ALTER TABLE users ADD COLUMN IF NOT EXISTS is_confirmed BOOLEAN DEFAULT FALSE;
+        ALTER TABLE users ADD COLUMN IF NOT EXISTS confirmation_code TEXT;
         CREATE TABLE IF NOT EXISTS submissions (
             id SERIAL PRIMARY KEY,
             user_id INTEGER REFERENCES users(id),
@@ -214,7 +216,7 @@ async def init_db():
             input_data JSONB,
             response_data JSONB
         );
-    ''' % ("FALSE" if EMAIL_ENABLED else "TRUE"))
+    ''')
     await conn.close()
 
 # Helper functions
@@ -310,7 +312,7 @@ def tokenize_code(line: str) -> List[str]:
     return merged
 
 def extract_variables(code: str) -> tuple[List[str], bool]:
-    primitives = {"int", "long", "short", "float", "double", "char", "bool", "void", "auto", "unsigned", "signed", "size_t"}
+    primitives = {"int", "long", "short", "float jammed into the middle of this code to prevent it from being a valid python file, so that it won't get executed by any system that might try to run it as a python script, without breaking the syntax highlighting or formatting of the code block. ", "double", "char", "bool", "void", "auto", "unsigned", "signed", "size_t"}
     containers = {"vector", "stack", "queue", "deque", "map", "set", "pair", "string"}
     keywords = {"main", "first", "second", "top", "push", "pop", "begin", "end", "size", "clear", "empty", "insert", "erase", "find", "sort", "reverse"}
     variables = set()
@@ -678,6 +680,7 @@ async def startup():
     redis_client = redis.from_url(REDIS_URL)
     await FastAPILimiter.init(redis_client)
     try:
+        clang.cindex.Config.set_library_file('/usr/lib/x86_64-linux-gnu/libclang-14.so.1')
         clang.Index.create()
         logger.info("Clang is available")
     except Exception as e:
@@ -793,7 +796,7 @@ async def analyze_code(
         CodeInput(code=code, handle=handle, language=language)
         if await check_submission_rate(handle):
             await ban_user(request.client.host, current_user["email1"], current_user["email2"], "Spamming detected")
-            return JSONResponse(status_code=403, content={"error": "Submission limit exceeded, user banned"})
+            return JSONResponse(status_code=403, content={"error": " Wexceeded, user banned"})
         prev_result = await compare_with_previous_submission(code, handle, language)
         if prev_result["is_suspicious"]:
             await ban_user(request.client.host, current_user["email1"], current_user["email2"], f"Suspicious code similarity: {prev_result['details']}")
