@@ -24,8 +24,8 @@ import tempfile
 from fastapi_limiter import FastAPILimiter
 import redis.asyncio as redis
 import secrets
-import sendgrid
-from sendgrid.helpers.mail import Content, Email, Mail
+import smtplib
+from email.mime.text import MIMEText
 
 # Logging setup
 class JSONFormatter(logging.Formatter):
@@ -54,7 +54,10 @@ OPENROUTER_API_KEY = getenv("OPENROUTER_API_KEY")
 SECRET_KEY = getenv("SECRET_KEY")
 DB_URL = getenv("DATABASE_URL")
 REDIS_URL = getenv("REDIS_URL")
-SENDGRID_API_KEY = getenv("SENDGRID_API_KEY")
+EMAIL_HOST = getenv("EMAIL_HOST")
+EMAIL_PORT = int(getenv("EMAIL_PORT", 587))
+EMAIL_USER = getenv("EMAIL_USER")
+EMAIL_PASSWORD = getenv("EMAIL_PASSWORD")
 
 missing_vars = []
 if not OPENROUTER_API_KEY:
@@ -65,15 +68,15 @@ if not DB_URL:
     missing_vars.append("DATABASE_URL")
 if not REDIS_URL:
     missing_vars.append("REDIS_URL")
-if not SENDGRID_API_KEY:
-    missing_vars.append("SENDGRID_API_KEY")
+if not all([EMAIL_HOST, EMAIL_PORT, EMAIL_USER, EMAIL_PASSWORD]):
+    missing_vars.append("EMAIL_HOST, EMAIL_PORT, EMAIL_USER, or EMAIL_PASSWORD")
 if missing_vars:
     logger.error(f"Missing required environment variables: {', '.join(missing_vars)}")
     raise RuntimeError(f"Missing required environment variables: {', '.join(missing_vars)}")
 if not OPENROUTER_API_KEY.startswith("sk-or-v1-"):
     logger.error("Invalid OPENROUTER_API_KEY format")
     raise RuntimeError("Invalid OPENROUTER_API_KEY format")
-EMAIL_ENABLED = bool(SENDGRID_API_KEY)
+EMAIL_ENABLED = bool(EMAIL_HOST and EMAIL_PORT and EMAIL_USER and EMAIL_PASSWORD)
 masked_key = f"{OPENROUTER_API_KEY[:10]}...{OPENROUTER_API_KEY[-4:]}" if OPENROUTER_API_KEY else "None"
 logger.info(f"Loaded OPENROUTER_API_KEY: {masked_key}")
 
@@ -268,19 +271,17 @@ def send_confirmation_email(email: str, code: str):
         logger.info(f"Email confirmation disabled, skipping email to {email}")
         return
     try:
-        sg = sendgrid.SendGridAPIClient(api_key=SENDGRID_API_KEY)
-        from_email = Email("no-reply@codeplagiarismchecker.com")
-        to_email = Email(email)
-        subject = "Email Confirmation"
-        content = Content("text/plain", f"Your confirmation code is: {code}")
-        mail = Mail(from_email, subject, to_email, content)
-        response = sg.client.mail.send.post(request_body=mail.get())
-        if response.status_code >= 200 and response.status_code < 300:
-            logger.info(f"Confirmation email sent to {email}")
-        else:
-            logger.error(f"Failed to send email to {email}: Status {response.status_code}")
+        msg = MIMEText(f"Your confirmation code is: {code}")
+        msg['Subject'] = "Email Confirmation"
+        msg['From'] = EMAIL_USER
+        msg['To'] = email
+        with smtplib.SMTP(EMAIL_HOST, EMAIL_PORT) as server:
+            server.starttls()
+            server.login(EMAIL_USER, EMAIL_PASSWORD)
+            server.sendmail(EMAIL_USER, [email], msg.as_string())
+        logger.info(f"Confirmation email sent to {email}")
     except Exception as e:
-        logger.error(f"SendGrid error sending email to {email}: {e}")
+        logger.error(f"Failed to send email to {email}: {e}")
 
 def clean_code(code: str, preserve_comments: bool = False) -> str:
     if not code:
