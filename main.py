@@ -12,7 +12,6 @@ import json
 import re
 import hashlib
 import asyncpg
-from openai import AsyncOpenAI, APIError
 import ast
 import clang.cindex as clang
 from collections import Counter
@@ -26,6 +25,7 @@ import redis.asyncio as redis
 import secrets
 import smtplib
 from email.mime.text import MIMEText
+import requests
 
 # Logging setup
 class JSONFormatter(logging.Formatter):
@@ -50,7 +50,6 @@ logging.basicConfig(level=getattr(logging, log_level if log_level in valid_log_l
 
 # Load environment variables
 load_dotenv()
-OPENROUTER_API_KEY = getenv("OPENROUTER_API_KEY")
 SECRET_KEY = getenv("SECRET_KEY")
 DB_URL = getenv("DATABASE_URL")
 REDIS_URL = getenv("REDIS_URL")
@@ -60,8 +59,6 @@ EMAIL_USER = getenv("EMAIL_USER")
 EMAIL_PASSWORD = getenv("EMAIL_PASSWORD")
 
 missing_vars = []
-if not OPENROUTER_API_KEY:
-    missing_vars.append("OPENROUTER_API_KEY")
 if not SECRET_KEY:
     missing_vars.append("SECRET_KEY")
 if not DB_URL:
@@ -73,12 +70,7 @@ if not all([EMAIL_HOST, EMAIL_PORT, EMAIL_USER, EMAIL_PASSWORD]):
 if missing_vars:
     logger.error(f"Missing required environment variables: {', '.join(missing_vars)}")
     raise RuntimeError(f"Missing required environment variables: {', '.join(missing_vars)}")
-if not OPENROUTER_API_KEY.startswith("sk-or-v1-"):
-    logger.error("Invalid OPENROUTER_API_KEY format")
-    raise RuntimeError("Invalid OPENROUTER_API_KEY format")
 EMAIL_ENABLED = bool(EMAIL_HOST and EMAIL_PORT and EMAIL_USER and EMAIL_PASSWORD)
-masked_key = f"{OPENROUTER_API_KEY[:10]}...{OPENROUTER_API_KEY[-4:]}" if OPENROUTER_API_KEY else "None"
-logger.info(f"Loaded OPENROUTER_API_KEY: {masked_key}")
 
 # FastAPI setup
 app = FastAPI(title="AtCoder Plagiarism Detector", version="1.0.0")
@@ -588,32 +580,24 @@ async def compare_with_previous_submission(code: str, handle: str, language: str
 async def detect_plagiarism(code: str, handle: str, language: str) -> Dict[str, Any]:
     if not code:
         return {"is_plagiarized": False, "details": "Empty code", "status": "N", "evidence": ["Empty code"]}
-    client = AsyncOpenAI(base_url="https://openrouter.ai/api/v1", api_key=OPENROUTER_API_KEY)
     try:
-        intent_prompt = [
-            {"role": "system", "content": f"Describe the purpose of the following {language.upper()} code concisely."},
-            {"role": "user", "content": f"```{language}\n{code}\n```"}
-        ]
-        intent_response = await client.chat.completions.create(
-            model="deepseek/deepseek-r1-0528:free",
-            messages=intent_prompt,
-            temperature=0.7,
-            max_tokens=500
-        )
-        intent = intent_response.choices[0].message.content.strip()
+        intent_prompt_system = f"Describe the purpose of the following {language.upper()} code concisely."
+        intent_prompt_user = f"```{language}\n{code}\n```"
+        prompt = intent_prompt_system + "\n\n" + intent_prompt_user
+        url = "https://5ss2zgz4apjoblk4ekqndrpqjdx2if2chdmxcxqogs5puutkn77rh4ad.onion/ask"
+        response = requests.get(url, params={"question": prompt})
+        if response.status_code != 200:
+            raise Exception(response.json()["error"])
+        intent = response.json()["answer"].strip()
         if not intent:
             return {"is_plagiarized": False, "details": "Failed to get intent", "status": "N", "evidence": ["Failed to get intent"]}
-        generate_prompt = [
-            {"role": "system", "content": f"Generate {language.upper()} code solving the described problem using modern {language.upper()} practices."},
-            {"role": "user", "content": intent}
-        ]
-        generated_response = await client.chat.completions.create(
-            model="deepseek/deepseek-r1-0528:free",
-            messages=generate_prompt,
-            temperature=0.7,
-            max_tokens=2000
-        )
-        generated = generated_response.choices[0].message.content.strip()
+        generate_prompt_system = f"Generate {language.upper()} code solving the described problem using modern {language.upper()} practices."
+        generate_prompt_user = intent
+        prompt = generate_prompt_system + "\n\n" + generate_prompt_user
+        response = requests.get(url, params={"question": prompt})
+        if response.status_code != 200:
+            raise Exception(response.json()["error"])
+        generated = response.json()["answer"].strip()
         match = re.search(rf"```{language}\n(.*?)```", generated, re.DOTALL)
         generated_code = match.group(1).strip() if match else generated
         if not generated_code:
@@ -642,11 +626,9 @@ async def detect_plagiarism(code: str, handle: str, language: str) -> Dict[str, 
             "status": "S" if is_plagiarized else "N",
             "evidence": evidence
         }
-    except APIError as e:
-        logger.error(f"OpenRouter API error: {e}")
+    except Exception as e:
+        logger.error(f"API error: {e}")
         return {"is_plagiarized": False, "details": str(e), "status": "N", "evidence": [str(e)]}
-    finally:
-        await client.close()
 
 async def check_submission_rate(handle: str) -> bool:
     conn = await asyncpg.connect(DB_URL)
