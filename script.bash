@@ -1,36 +1,24 @@
 #!/bin/bash
-
-# Loop over archives
-find . -type f \( -name "*.gz" -o -name "*.xz" \) | while read -r archive; do
-    # Create a temporary directory
+find . -type f -name "*.gz" | while read -r archive; do
     tmpdir=$(mktemp -d)
-
-    # Try to extract based on archive type
-    if [[ "$archive" == *.gz ]]; then
-        tar -xzf "$archive" -C "$tmpdir" 2>/dev/null || gzip -cd "$archive" > "$tmpdir/file" 2>/dev/null
-    elif [[ "$archive" == *.xz ]]; then
-        tar -xJf "$archive" -C "$tmpdir" 2>/dev/null || xz -cd "$archive" > "$tmpdir/file" 2>/dev/null
-    fi
-
-    # Find python files inside the extracted content
+    tar -xzf "$archive" -C "$tmpdir" 2>/dev/null || gzip -cd "$archive" > "$tmpdir/file" 2>/dev/null
     find "$tmpdir" -type f -name "*.py" | while read -r pyfile; do
         clear
-        echo "Opening: $pyfile from $archive"
-        nano "$pyfile" # let user inspect
-        read -p "Is this the file? Yes/no: " answer
+        echo "===== Showing: $pyfile from $archive ====="
+        echo
+        cat "$pyfile"
+        echo
+        echo "=========================================="
+        read -p "Press Enter when you are done reading..." dummy
+        read -p "this is the file Yes/no: " answer
         case "$answer" in
-            [Yy]* )
-                echo "Confirmed. Keeping $archive, removing all others..."
-                find . -type f \( -name "*.gz" -o -name "*.xz" \) ! -path "$archive" -delete
-                rm -rf "$tmpdir"
-                exit 0
-                ;;
-            * )
-                echo "Skipping..."
-                ;;
+            [Yy]*) echo "Confirmed. Keeping $archive, removing all others..."
+                   find . -type f -name "*.gz" ! -path "$archive" -delete
+                   rm -rf "$tmpdir"
+                   exit 0 ;;
+            *) echo "Skipping..." ;;
         esac
     done
     rm -rf "$tmpdir"
 done
-
 echo "No matching file confirmed."
